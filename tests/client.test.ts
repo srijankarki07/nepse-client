@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { COLUMNS, createClient, memoryCache, type Cache } from "../src/index.js";
+import { COLUMNS, createClient, memoryCache, noCache, type Cache } from "../src/index.js";
 
 const HEADER = COLUMNS.join(",");
 
@@ -52,8 +52,12 @@ const MANIFEST = JSON.stringify({
   years: { "2026": 3 },
 });
 
+/** The archive's date list, as it really publishes one. */
+const SESSIONS_INDEX = JSON.stringify(["2026-09-29", "2026-09-30", "2026-10-01"]);
+
 const ARCHIVE: Record<string, string> = {
   "data/latest.json": MANIFEST,
+  "data/sessions.json": SESSIONS_INDEX,
   "data/daily/2026/2026-10-01.csv": sessionBody("2026-10-01", { NABIL: 566, ADBL: 307.5 }),
   "data/daily/2026/2026-09-30.csv": sessionBody("2026-09-30", { NABIL: 570, ADBL: 307.5 }),
   "data/daily/2026/2026-09-29.csv": sessionBody("2026-09-29", { NABIL: 560 }),
@@ -262,7 +266,20 @@ describe("sessions and history", () => {
     ]);
   });
 
-  it("reports progress over the whole calendar range, not just the hits", async () => {
+  it("asks the archive for its date list rather than probing every day", async () => {
+    // The whole point of the index: with it, a range costs one request for the list plus
+    // one per session. Without it, a third of the requests discover nothing.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.sessions({ from: "2026-09-29", to: "2026-10-01" });
+
+    expect(requested.filter((url) => url.endsWith("sessions.json"))).toHaveLength(1);
+    // Three sessions for a three-day range: no request was spent on a day that is not one.
+    expect(requested.filter((url) => url.endsWith(".csv"))).toHaveLength(3);
+  });
+
+  it("reports progress over the sessions in range", async () => {
     const { fetchImpl } = fakeArchive(ARCHIVE);
     const client = createClient({ fetch: fetchImpl });
 
@@ -273,8 +290,87 @@ describe("sessions and history", () => {
       onProgress: (progress) => seen.push({ done: progress.done, total: progress.total }),
     });
 
-    expect(seen).toHaveLength(4);
-    expect(seen.at(-1)).toEqual({ done: 4, total: 4 });
+    // Three, not four: with the date list, the 28th is never a candidate.
+    expect(seen).toHaveLength(3);
+    expect(seen.at(-1)).toEqual({ done: 3, total: 3 });
+  });
+
+  it("uses the date list even when caching is switched off", async () => {
+    // The bug this exists for: the fetcher wrote the list to the cache and then read it
+    // back out. With `noCache()` the write goes nowhere, so a perfectly good fetch was
+    // discarded and the client walked calendar days while believing it had the index —
+    // slower, and invisible, because the fallback is designed to be correct.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, cache: noCache() });
+
+    const dates = await client.sessionDates({ from: "2026-09-28", to: "2026-10-01" });
+
+    expect(dates).toEqual(["2026-09-29", "2026-09-30", "2026-10-01"]);
+    // One request for the list, three for the sessions — not four calendar probes.
+    expect(requested.filter((url) => url.endsWith(".csv"))).toHaveLength(0);
+  });
+
+  it("re-reads the date list once it expires, so a new session is not missed forever", async () => {
+    // The bug this exists for: the first version cached the date list permanently, on the
+    // reasoning that appending cannot invalidate the past. True, and beside the point —
+    // the question a range asks is usually about dates near the end. A client that read
+    // the list yesterday would have gone on believing today's session did not exist, for
+    // the life of the cache, with no way to notice.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, manifestTtlMs: 0 });
+
+    await client.sessionDates({ from: "2026-09-01", to: "2026-10-01" });
+    await client.sessionDates({ from: "2026-09-01", to: "2026-10-01" });
+
+    expect(requested.filter((url) => url.endsWith("sessions.json"))).toHaveLength(2);
+  });
+
+  it("keeps a session forever, because a session file cannot change", async () => {
+    // The other half of the rule, asserted together with it so the two cannot drift.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, manifestTtlMs: 0 });
+
+    await client.session("2026-10-01");
+    await client.session("2026-10-01");
+
+    expect(requested.filter((url) => url.endsWith("2026-10-01.csv"))).toHaveLength(1);
+  });
+
+  it("falls back to walking calendar days when the archive publishes no date list", async () => {
+    // The path that cannot be wrong: it asks about every day and lets the archive answer.
+    // Kept because a wrong answer here is a silently missing session, and the trading week
+    // has changed once already.
+    const withoutIndex = { ...ARCHIVE };
+    delete withoutIndex["data/sessions.json"];
+
+    const { fetchImpl, requested } = fakeArchive(withoutIndex);
+    const client = createClient({ fetch: fetchImpl });
+
+    const sessions = await client.sessions({ from: "2026-09-28", to: "2026-10-01" });
+
+    expect(sessions.map((entry) => entry.date)).toEqual([
+      "2026-09-29",
+      "2026-09-30",
+      "2026-10-01",
+    ]);
+    // Four calendar days asked about, one of them absent — the cost of having no index.
+    expect(requested.filter((url) => url.endsWith(".csv"))).toHaveLength(4);
+  });
+
+  it("rejects a range that ends before it starts, on either path", async () => {
+    const withIndex = fakeArchive(ARCHIVE);
+    const withoutIndex = fakeArchive((() => {
+      const copy = { ...ARCHIVE };
+      delete copy["data/sessions.json"];
+      return copy;
+    })());
+
+    for (const { fetchImpl } of [withIndex, withoutIndex]) {
+      const client = createClient({ fetch: fetchImpl });
+      await expect(client.sessions({ from: "2026-10-01", to: "2026-09-01" })).rejects.toThrow(
+        /before it starts/,
+      );
+    }
   });
 
   it("builds one scrip's series and omits days it did not trade", async () => {
@@ -306,6 +402,28 @@ describe("sessions and history", () => {
     await client.sessions({ from: "2026-09-28", to: "2026-10-01" });
 
     expect(requested.length).toBe(afterFirst);
+  });
+});
+
+describe("sessionDates", () => {
+  it("lists the sessions in a range without fetching any of them", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const dates = await client.sessionDates({ from: "2026-09-01", to: "2026-10-01" });
+
+    expect(dates).toEqual(["2026-09-29", "2026-09-30", "2026-10-01"]);
+    expect(requested.filter((url) => url.endsWith(".csv"))).toHaveLength(0);
+  });
+
+  it("reads the date list once across many ranges, because it only ever grows", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.sessionDates({ from: "2026-09-01", to: "2026-10-01" });
+    await client.sessionDates({ from: "2026-09-29", to: "2026-09-30" });
+
+    expect(requested.filter((url) => url.endsWith("sessions.json"))).toHaveLength(1);
   });
 });
 

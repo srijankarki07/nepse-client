@@ -38,7 +38,9 @@ import type {
 } from "./types.js";
 
 const MANIFEST_PATH = "data/latest.json";
+const SESSIONS_PATH = "data/sessions.json";
 const MANIFEST_KEY = "manifest";
+const SESSIONS_KEY = "sessions-index";
 
 /** How long a manifest may be reused. It changes at most once a day. */
 const DEFAULT_MANIFEST_TTL_MS = 5 * 60 * 1000;
@@ -100,6 +102,16 @@ export interface NepseDataClient {
   history(symbol: string, range: RangeOptions): Promise<DatedQuote[]>;
   /** Tickers listed in the latest session. */
   symbols(): Promise<string[]>;
+  /**
+   * Every archived session date within a range, ascending.
+   *
+   * Cheap — one request for the archive's date list, then a filter — and useful on its
+   * own for a picker, a calendar, or a coverage chart. `sessions()` is built on it.
+   *
+   * Days the market was shut are simply absent, so a gap between two dates means the
+   * exchange did not trade, never that the client skipped something.
+   */
+  sessionDates(range: { from: string; to: string }): Promise<string[]>;
 }
 
 function assertDate(value: string, what: string): string {
@@ -137,6 +149,9 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
 
   /** In-flight reads, so ten components asking for one session make one request. */
   const inFlight = new Map<string, Promise<string>>();
+
+  /** When the cached date list stops being trusted. See `readSessionDates`. */
+  let sessionsFreshUntil = 0;
 
   /** Reads through the cache, collapsing concurrent misses onto one request. */
   async function readThrough(key: string, path: string): Promise<string | null> {
@@ -232,22 +247,96 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     return session(index.latest);
   }
 
-  async function sessions(range: RangeOptions): Promise<Session[]> {
+  /**
+   * The archive's list of session dates, or `null` when it does not publish one.
+   *
+   * ## Why this expires and a session file does not
+   *
+   * The rule is **immutable caches forever, mutable expires**, and the two are not the
+   * same kind of thing. A session file is written once. The date list gains a date every
+   * trading day, so caching it permanently would mean a client that read it yesterday
+   * goes on believing today's session does not exist — for the life of that cache, with
+   * no way to notice.
+   *
+   * It is easy to get wrong, because both feel like "the archive's data". The first
+   * version of this cached the index forever and reasoned that appending cannot
+   * invalidate the past — which is true, and beside the point, because the question a
+   * range asks is usually about dates near the end.
+   *
+   * The CDN makes it sharper rather than softer: jsDelivr caches the branch, so for a
+   * short window after the daily commit it can serve yesterday's list. Expiring is what
+   * lets that correct itself.
+   */
+  async function readSessionDates(): Promise<string[] | null> {
+    // The body is held here rather than read back out of the cache afterwards. Reading it
+    // back looks equivalent and is not: with `noCache()` — which is a supported
+    // configuration, and the one every live probe uses — the write goes nowhere and the
+    // read always misses, so a successful fetch would be thrown away and the client would
+    // fall back to calendar-walking while believing it had the index.
+    let body = await cache.get(SESSIONS_KEY);
+
+    if (body === null || Date.now() >= sessionsFreshUntil) {
+      try {
+        const fresh = await transport.get(SESSIONS_PATH);
+        body = fresh;
+        await cache.set(SESSIONS_KEY, fresh);
+      } catch {
+        // No date list published, or the CDN has not caught up with it yet. A cached copy
+        // is used if there is one; otherwise the caller walks calendar days, which is the
+        // path that cannot be wrong.
+      }
+      sessionsFreshUntil = Date.now() + manifestTtlMs;
+    }
+
+    if (body === null) return null;
+
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (!Array.isArray(parsed)) return null;
+      return parsed.filter((entry): entry is string => typeof entry === "string");
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The sessions in a range.
+   *
+   * When the archive publishes its date list — which it does — this is exact: one request
+   * for the list plus one per session, with nothing spent discovering that the market was
+   * shut.
+   *
+   * If the list is ever absent the range is walked as calendar days instead. That path is
+   * kept because it is the one that cannot be wrong: it asks about every day and lets the
+   * archive answer. It is also what this client did before the date list existed.
+   */
+  async function datesIn(range: RangeOptions): Promise<string[]> {
     assertDate(range.from, "range start");
     assertDate(range.to, "range end");
 
-    const days = eachDay(range.from, range.to);
+    if (range.from > range.to) {
+      throw new ArchiveFormatError(`The range ends on ${range.to}, before it starts on ${range.from}.`);
+    }
+
+    const known = await readSessionDates();
+    if (known === null) return eachDay(range.from, range.to);
+
+    return known.filter((date) => date >= range.from && date <= range.to);
+  }
+
+  async function sessions(range: RangeOptions): Promise<Session[]> {
+    const dates = await datesIn(range);
     let done = 0;
 
     const found = await mapWithConcurrency(
-      days,
+      dates,
       concurrency ?? 6,
       async (date) => {
         if (range.signal?.aborted === true) return null;
 
         const body = await readThrough(`session/${date}`, sessionPath(date));
         done += 1;
-        range.onProgress?.({ done, total: days.length, date });
+        range.onProgress?.({ done, total: dates.length, date });
 
         return body === null ? null : { date, rows: parseSessionCsv(body, date) };
       },
@@ -315,5 +404,14 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     return current.rows.map((row) => row.symbol);
   }
 
-  return { manifest, session, latest, sessions, quote, history, symbols };
+  return {
+    manifest,
+    session,
+    latest,
+    sessions,
+    quote,
+    history,
+    symbols,
+    sessionDates: (range) => datesIn({ from: range.from, to: range.to }),
+  };
 }
