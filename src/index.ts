@@ -43,6 +43,7 @@ export {
   DEFAULT_CONCURRENCY,
   DEFAULT_HOSTS,
   SessionNotFoundError,
+  SymbolNotFoundError,
   createTransport,
   mapWithConcurrency,
   type Transport,

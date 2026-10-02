@@ -28,7 +28,14 @@
 
 import { type Cache, memoryCache } from "./cache.js";
 import { ArchiveFormatError, parseSessionCsv } from "./csv.js";
-import { mapWithConcurrency, createTransport, type Transport, type TransportOptions } from "./transport.js";
+import {
+  SessionNotFoundError,
+  SymbolNotFoundError,
+  createTransport,
+  mapWithConcurrency,
+  type Transport,
+  type TransportOptions,
+} from "./transport.js";
 import type {
   ArchiveManifest,
   DatedQuote,
@@ -251,7 +258,12 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
 
     const body = await readThrough(`session/${date}`, sessionPath(date));
     if (body === null) {
-      throw new ArchiveFormatError(
+      // A `SessionNotFoundError`, not a format error: nothing is malformed, the archive
+      // simply holds no file for a day the market did not trade. Callers are told they
+      // can catch this, so it has to be what actually arrives.
+      throw new SessionNotFoundError(
+        sessionPath(date),
+        404,
         `The archive has no session for ${date}. The market did not trade that day, or ` +
           "the date is outside the archive.",
       );
@@ -385,7 +397,8 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
 
     const quoteRow = current.rows.find((row) => row.symbol === wanted);
     if (quoteRow === undefined) {
-      throw new ArchiveFormatError(
+      throw new SymbolNotFoundError(
+        wanted,
         `${wanted} is not listed in the ${index.latest} session. It may be suspended, ` +
           "delisted, or misspelt.",
       );

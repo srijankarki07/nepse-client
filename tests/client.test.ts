@@ -8,7 +8,15 @@
 
 import { describe, expect, it } from "vitest";
 
-import { COLUMNS, createClient, memoryCache, noCache, type Cache } from "../src/index.js";
+import {
+  COLUMNS,
+  SessionNotFoundError,
+  SymbolNotFoundError,
+  createClient,
+  memoryCache,
+  noCache,
+  type Cache,
+} from "../src/index.js";
 
 const HEADER = COLUMNS.join(",");
 
@@ -431,6 +439,39 @@ describe("sessionDates", () => {
     await client.sessionDates({ from: "2026-09-29", to: "2026-09-30" });
 
     expect(requested.filter((url) => url.endsWith("sessions.json"))).toHaveLength(1);
+  });
+});
+
+describe("the errors a caller can catch", () => {
+  // The point of a named error is that somebody acts on it. `SessionNotFoundError` was
+  // exported and documented for a year while `session()` actually threw a format error,
+  // so a caller handling holidays caught nothing at all and had no way to notice.
+  it("throws SessionNotFoundError for a day the market did not trade", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await expect(client.session("2026-09-28")).rejects.toBeInstanceOf(SessionNotFoundError);
+  });
+
+  it("throws SymbolNotFoundError for a ticker that is not listed", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await expect(client.quote("NOSUCH")).rejects.toBeInstanceOf(SymbolNotFoundError);
+  });
+
+  it("keeps the two apart, because they mean different things", async () => {
+    // One is a day the exchange was shut; the other is a scrip that is suspended or
+    // misspelt. A caller retrying the first wastes time, and one treating the second as
+    // a holiday is simply wrong.
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const missingDay = await client.session("2026-09-28").catch((error: unknown) => error);
+    const missingSymbol = await client.quote("NOSUCH").catch((error: unknown) => error);
+
+    expect(missingDay).toBeInstanceOf(SessionNotFoundError);
+    expect(missingSymbol).not.toBeInstanceOf(SessionNotFoundError);
   });
 });
 

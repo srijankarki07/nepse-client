@@ -32,13 +32,34 @@ export class SessionNotFoundError extends Error {
   constructor(
     readonly path: string,
     readonly status: number,
+    /**
+     * Why the caller thinks it is missing, when it knows better than the path does.
+     *
+     * The transport can only say "no file at this path"; a caller asking for a session
+     * can say "the market did not trade that day", which is what the reader actually
+     * needs. Without this the message describes an HTTP exchange instead of a market.
+     */
+    message?: string,
   ) {
-    super(
-      `The archive has nothing at ${path} (HTTP ${status}). If this was a session date, ` +
-        "the market most likely did not trade that day — the archive keeps no file for a " +
-        "day with no session.",
-    );
+    super(message ?? `The archive has nothing at ${path} (HTTP ${status}).`);
     this.name = "SessionNotFoundError";
+  }
+}
+
+/**
+ * A ticker the archive does not list.
+ *
+ * Distinct from a missing session: one is a day the market was shut, the other is a scrip
+ * that is suspended, delisted, or misspelt. A caller retrying the first would be wasting
+ * its time, and a caller treating the second as a holiday would be wrong.
+ */
+export class SymbolNotFoundError extends Error {
+  constructor(
+    readonly symbol: string,
+    message?: string,
+  ) {
+    super(message ?? `${symbol} is not in this session.`);
+    this.name = "SymbolNotFoundError";
   }
 }
 
