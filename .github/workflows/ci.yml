@@ -1,0 +1,72 @@
+name: CI
+
+# The offline suite is what gates a change: it is deterministic and never touches the
+# network. The live suite runs beside it, but deliberately does not gate anything — it
+# asserts that the archive still speaks the format this package reads, so a failure means
+# "something changed upstream", which is not a reason to block a pull request here.
+#
+# It is worth having in CI all the same, because that failure is exactly the one nobody
+# notices until a user reports it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      # A consumer never runs the TypeScript, so the build is what actually ships. Packing
+      # it proves `exports`, `types` and `files` resolve before a publish does.
+      - name: Package
+        run: npm pack --dry-run
+
+  contract:
+    runs-on: ubuntu-latest
+    # Not a gate — see the note above.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Against the real archive
+        run: pnpm test:live
