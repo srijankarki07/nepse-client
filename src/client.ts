@@ -35,12 +35,15 @@ import type {
   ManifestResult,
   Quote,
   Session,
+  SymbolDirectory,
 } from "./types.js";
 
 const MANIFEST_PATH = "data/latest.json";
 const SESSIONS_PATH = "data/sessions.json";
+const SYMBOLS_PATH = "data/symbols.json";
 const MANIFEST_KEY = "manifest";
 const SESSIONS_KEY = "sessions-index";
+const SYMBOLS_KEY = "symbols-directory";
 
 /** How long a manifest may be reused. It changes at most once a day. */
 const DEFAULT_MANIFEST_TTL_MS = 5 * 60 * 1000;
@@ -103,6 +106,21 @@ export interface NepseDataClient {
   /** Tickers listed in the latest session. */
   symbols(): Promise<string[]>;
   /**
+   * Ticker to company name, for every scrip the archive has seen since it began
+   * publishing names.
+   *
+   * Read this for a browsable list — a market table of bare tickers is hard to read, and
+   * a symbol page needs something to put in its heading.
+   *
+   * **It is not complete, and cannot be.** Names are learned from the source page as
+   * scrips appear, so a company that stopped trading before the archive started recording
+   * names has prices here and no name. Check `lastSeen` against `manifest().latest` to
+   * tell a delisted scrip from a live one.
+   */
+  directory(): Promise<SymbolDirectory>;
+  /** The name for one ticker, or `null` when the archive has never recorded one. */
+  name(symbol: string): Promise<string | null>;
+  /**
    * Every archived session date within a range, ascending.
    *
    * Cheap — one request for the archive's date list, then a filter — and useful on its
@@ -152,6 +170,9 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
 
   /** When the cached date list stops being trusted. See `readSessionDates`. */
   let sessionsFreshUntil = 0;
+
+  /** The same, for the ticker directory. */
+  let symbolsFreshUntil = 0;
 
   /** Reads through the cache, collapsing concurrent misses onto one request. */
   async function readThrough(key: string, path: string): Promise<string | null> {
@@ -404,6 +425,53 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     return current.rows.map((row) => row.symbol);
   }
 
+  /**
+   * The ticker directory.
+   *
+   * Expires like the session list rather than caching forever like a session, and for the
+   * same reason: scrips are added to it, so a copy read yesterday is a copy that cannot
+   * name a company listed today.
+   *
+   * An archive that publishes no directory is not an error. The names are a convenience
+   * on top of the prices, so a missing file yields an empty object and the caller falls
+   * back to tickers.
+   */
+  async function directory(): Promise<SymbolDirectory> {
+    // Held here rather than read back from the cache afterwards, for the reason spelled
+    // out on `readSessionDates`: with `noCache()` the write goes nowhere, and reading back
+    // would discard a perfectly good fetch.
+    let body = await cache.get(SYMBOLS_KEY);
+
+    if (body === null || Date.now() >= symbolsFreshUntil) {
+      try {
+        const fresh = await transport.get(SYMBOLS_PATH);
+        body = fresh;
+        await cache.set(SYMBOLS_KEY, fresh);
+      } catch {
+        // Not published, or the CDN has not caught up. Whatever is cached is used; if
+        // nothing is, the caller gets an empty directory.
+      }
+      symbolsFreshUntil = Date.now() + manifestTtlMs;
+    }
+
+    if (body === null) return {};
+
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      return parsed as SymbolDirectory;
+    } catch {
+      return {};
+    }
+  }
+
+  async function name(symbol: string): Promise<string | null> {
+    const wanted = symbol.trim().toUpperCase();
+    if (wanted === "") return null;
+
+    return (await directory())[wanted]?.name ?? null;
+  }
+
   return {
     manifest,
     session,
@@ -412,6 +480,8 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     quote,
     history,
     symbols,
+    directory,
+    name,
     sessionDates: (range) => datesIn({ from: range.from, to: range.to }),
   };
 }

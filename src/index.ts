@@ -57,4 +57,6 @@ export type {
   ManifestResult,
   Quote,
   Session,
+  SymbolDirectory,
+  SymbolEntry,
 } from "./types.js";

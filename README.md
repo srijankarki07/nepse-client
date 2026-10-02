@@ -81,10 +81,13 @@ One session, whole market: `{ date, rows }`. `latest()` is the newest.
 
 Every session in a calendar range, ascending. Days the market was shut are skipped.
 
-> **This is the expensive call.** The archive has no date index, so a range is walked as
-> calendar days and the days without a file are probed and skipped. A year costs roughly
-> 365 requests to return ~240 sessions. The first call pays it; every absence is remembered,
-> so the second call over the same range costs nothing.
+> **This is the expensive call**, though less so than it was. The archive publishes a date
+> list, so a year costs **one request to learn which days traded, plus one per session** —
+> about 230 for 2025, rather than the 366 a calendar walk would spend. Sessions are cached
+> permanently once read, so the second call over the same range costs nothing at all.
+>
+> Where the archive publishes no date list, the client falls back to walking calendar days
+> and probing each one. Slower, and kept because it is the path that cannot be wrong.
 
 ### `quote(symbol)`
 
@@ -103,6 +106,30 @@ never a `null` gap.
 ### `symbols()`
 
 Tickers listed in the latest session.
+
+### `directory()` · `name(symbol)`
+
+Ticker to **company name**, plus the last session each appeared in — `NABIL` is
+Nabil Bank Limited. Use it for a browsable list; a market table of bare tickers is hard
+to read.
+
+Compare `lastSeen` against `manifest().latest`: equal means the scrip is still trading,
+and a date well behind it means the company stopped.
+
+> **It is not complete, and cannot be.** Names are learned from the source page as scrips
+> appear, so a company that stopped trading before the archive began recording names has
+> prices here and no name. Recovering those would mean re-reading fifteen years of pages
+> for companies that no longer exist. `name()` returns `null` rather than throwing, so
+> falling back to the ticker is one line.
+
+### `sessionDates({ from, to })`
+
+Which days in a range actually traded. One request — the archive publishes its date list —
+then a filter.
+
+Useful on its own for a picker or a coverage chart, and worth knowing about because it is
+what makes `sessions()` and `history()` cheap: the days the market was shut are never
+asked about.
 
 ## Notes that will save you time
 

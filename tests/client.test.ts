@@ -55,9 +55,16 @@ const MANIFEST = JSON.stringify({
 /** The archive's date list, as it really publishes one. */
 const SESSIONS_INDEX = JSON.stringify(["2026-09-29", "2026-09-30", "2026-10-01"]);
 
+const SYMBOLS = JSON.stringify({
+  NABIL: { name: "Nabil Bank Limited", lastSeen: "2026-10-01" },
+  ADBL: { name: "Agricultural Development Bank Limited", lastSeen: "2026-10-01" },
+  OLD: { name: "Delisted Finance Limited", lastSeen: "2020-01-01" },
+});
+
 const ARCHIVE: Record<string, string> = {
   "data/latest.json": MANIFEST,
   "data/sessions.json": SESSIONS_INDEX,
+  "data/symbols.json": SYMBOLS,
   "data/daily/2026/2026-10-01.csv": sessionBody("2026-10-01", { NABIL: 566, ADBL: 307.5 }),
   "data/daily/2026/2026-09-30.csv": sessionBody("2026-09-30", { NABIL: 570, ADBL: 307.5 }),
   "data/daily/2026/2026-09-29.csv": sessionBody("2026-09-29", { NABIL: 560 }),
@@ -433,6 +440,65 @@ describe("symbols", () => {
     const client = createClient({ fetch: fetchImpl });
 
     expect(await client.symbols()).toEqual(["NABIL", "ADBL"]);
+  });
+});
+
+describe("directory and names", () => {
+  it("returns ticker to company name", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const directory = await client.directory();
+
+    expect(directory["NABIL"]?.name).toBe("Nabil Bank Limited");
+    expect(directory["OLD"]?.lastSeen).toBe("2020-01-01");
+  });
+
+  it("looks a name up without caring about case", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    expect(await client.name("nabil")).toBe("Nabil Bank Limited");
+  });
+
+  it("returns null for a ticker the archive has never named", async () => {
+    // Rather than throwing: a missing name is not a broken lookup, and a caller that has
+    // to catch an exception to fall back to the ticker will not bother.
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    expect(await client.name("NOSUCH")).toBeNull();
+  });
+
+  it("is an empty directory, not an error, when none is published", async () => {
+    const withoutDirectory = { ...ARCHIVE };
+    delete withoutDirectory["data/symbols.json"];
+
+    const { fetchImpl } = fakeArchive(withoutDirectory);
+    const client = createClient({ fetch: fetchImpl });
+
+    expect(await client.directory()).toEqual({});
+    expect(await client.name("NABIL")).toBeNull();
+  });
+
+  it("re-reads the directory once it expires, so a new listing is not missed", async () => {
+    // Same failure mode as the session list: scrips are added, so a copy cached forever
+    // could never name a company listed after it was read.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, manifestTtlMs: 0 });
+
+    await client.directory();
+    await client.directory();
+
+    expect(requested.filter((url) => url.endsWith("symbols.json"))).toHaveLength(2);
+  });
+
+  it("uses the directory even when caching is switched off", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, cache: noCache() });
+
+    expect(await client.name("NABIL")).toBe("Nabil Bank Limited");
+    expect(requested.filter((url) => url.endsWith("symbols.json"))).toHaveLength(1);
   });
 });
 

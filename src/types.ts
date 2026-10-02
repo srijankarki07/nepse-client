@@ -80,3 +80,20 @@ export interface ManifestResult extends ArchiveManifest {
   /** The host that served the manifest. */
   source: string;
 }
+
+/** One scrip in the directory. */
+export interface SymbolEntry {
+  /** The company's name, as the source publishes it. */
+  name: string;
+  /**
+   * The most recent session this ticker appeared in.
+   *
+   * Compare against `manifest().latest`: equal means the scrip is still trading. A date
+   * well behind it means it stopped — which is the difference between a delisted company
+   * and one that never existed.
+   */
+  lastSeen: string;
+}
+
+/** Ticker to entry. What `directory()` returns. */
+export type SymbolDirectory = Record<string, SymbolEntry>;
