@@ -1,9 +1,19 @@
 {
-  "name": "nepse-data",
+  "name": "@srijankarki07/nepse-data",
   "version": "0.1.0",
   "description": "Read NEPSE end-of-day prices from a maintained public archive — no API key, no scraping, no server",
   "type": "module",
   "license": "MIT",
+  "author": "Srijan Karki",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/srijankarki07/nepse-client.git"
+  },
+  "homepage": "https://github.com/srijankarki07/nepse-client#readme",
+  "bugs": "https://github.com/srijankarki07/nepse-client/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.11"
   },
