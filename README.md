@@ -1,14 +1,14 @@
 # nepse-data
 
-Read **NEPSE** end-of-day prices (every listed scrip, every trading session since 2011,
+Read **NEPSE** end-of-day prices (every listed scrip, every trading session since 2011)
 from a public archive that maintains itself.
 
 ```bash
-npm install nepse-data
+npm install @srijankarki07/nepse-data
 ```
 
 ```ts
-import { createClient } from "nepse-data";
+import { createClient } from "@srijankarki07/nepse-data";
 
 const nepse = createClient();
 
@@ -39,10 +39,11 @@ npm versions are immutable, and a data-carrying package would need republishing 
 
 ## Where the data comes from
 
-A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data),
-scrapes ShareSansar's end-of-day table once a day and commits one CSV per session. It has
-run on a schedule since October 2026, holds **3,596 sessions from 2011 to today**, and its
-files are append-only: a session, once written, never changes.
+A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data)
+— the archive, not this package) scrapes ShareSansar's end-of-day table once a day and
+commits one CSV per session. It has run on a schedule since October 2026, holds
+**3,596 sessions from 2011 to today**, and its files are append-only: a session, once
+written, never changes.
 
 Two things follow from that, and both are load-bearing here:
 
@@ -124,7 +125,7 @@ and a date well behind it means the company stopped.
 
 ### `sessionDates({ from, to })`
 
-Which days in a range actually traded. One request (the archive publishes its date list,
+Which days in a range actually traded. One request (the archive publishes its date list),
 then a filter.
 
 Useful on its own for a picker or a coverage chart, and worth knowing about because it is
