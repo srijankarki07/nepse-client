@@ -39,8 +39,8 @@ npm versions are immutable, and a data-carrying package would need republishing 
 
 ## Where the data comes from
 
-A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data)
-— the archive, not this package) scrapes ShareSansar's end-of-day table once a day and
+A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data),
+the archive rather than this package) scrapes ShareSansar's end-of-day table once a day and
 commits one CSV per session. It has run on a schedule since October 2026, holds
 **3,596 sessions from 2011 to today**, and its files are append-only: a session, once
 written, never changes.
