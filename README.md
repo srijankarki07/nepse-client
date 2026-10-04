@@ -4,11 +4,11 @@ Read **NEPSE** end-of-day prices (every listed scrip, every trading session sinc
 from a public archive that maintains itself.
 
 ```bash
-npm install @srijankarki07/nepse-data
+npm install @srijankarki44/nepse-data
 ```
 
 ```ts
-import { createClient } from "@srijankarki07/nepse-data";
+import { createClient } from "@srijankarki44/nepse-data";
 
 const nepse = createClient();
 

@@ -1,5 +1,5 @@
 {
-  "name": "@srijankarki07/nepse-data",
+  "name": "@srijankarki44/nepse-data",
   "version": "0.1.0",
   "description": "Read NEPSE end-of-day prices from a maintained public archive — no API key, no scraping, no server",
   "type": "module",
