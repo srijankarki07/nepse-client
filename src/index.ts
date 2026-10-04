@@ -1,8 +1,8 @@
 /**
- * `@srijankarki07/nepse-data` — read NEPSE end-of-day prices from a maintained public archive.
+ * `@srijankarki44/nepse-data` — read NEPSE end-of-day prices from a maintained public archive.
  *
  * ```ts
- * import { createClient } from "@srijankarki07/nepse-data";
+ * import { createClient } from "@srijankarki44/nepse-data";
  *
  * const nepse = createClient();
  * const market = await nepse.latest();          // every scrip, newest session
