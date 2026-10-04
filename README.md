@@ -17,6 +17,8 @@ const nabil  = await nepse.quote("NABIL");    // with its day change
 const year   = await nepse.history("NABIL", { from: "2025-10-01", to: "2026-10-01" });
 ```
 
+There is a [live demo](https://stocks.srijankarki7.com.np) built on this package.
+
 No API key. No signup. No server. No scraping at runtime. No rate limit you have to think
 about. It reads a static archive over a CDN, so it works the same in a browser, in Node,
 in a serverless function and in a build step.
@@ -39,8 +41,8 @@ npm versions are immutable, and a data-carrying package would need republishing 
 
 ## Where the data comes from
 
-A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data)
-— the archive, not this package) scrapes ShareSansar's end-of-day table once a day and
+A separate repository ([`srijankarki07/nepse-data`](https://github.com/srijankarki07/nepse-data),
+the archive rather than this package) scrapes ShareSansar's end-of-day table once a day and
 commits one CSV per session. It has run on a schedule since October 2026, holds
 **3,596 sessions from 2011 to today**, and its files are append-only: a session, once
 written, never changes.
