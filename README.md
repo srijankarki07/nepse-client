@@ -17,6 +17,8 @@ const nabil  = await nepse.quote("NABIL");    // with its day change
 const year   = await nepse.history("NABIL", { from: "2025-10-01", to: "2026-10-01" });
 ```
 
+There is a [live demo](https://stocks.srijankarki7.com.np) built on this package.
+
 No API key. No signup. No server. No scraping at runtime. No rate limit you have to think
 about. It reads a static archive over a CDN, so it works the same in a browser, in Node,
 in a serverless function and in a build step.

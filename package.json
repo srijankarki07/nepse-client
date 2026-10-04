@@ -9,7 +9,7 @@
     "type": "git",
     "url": "git+https://github.com/srijankarki07/nepse-client.git"
   },
-  "homepage": "https://github.com/srijankarki07/nepse-client#readme",
+  "homepage": "https://stocks.srijankarki7.com.np",
   "bugs": "https://github.com/srijankarki07/nepse-client/issues",
   "publishConfig": {
     "access": "public"
