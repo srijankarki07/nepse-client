@@ -12,6 +12,7 @@ import {
   COLUMNS,
   SessionNotFoundError,
   SymbolNotFoundError,
+  cacheModeFor,
   createClient,
   memoryCache,
   noCache,
@@ -31,14 +32,17 @@ function sessionBody(date: string, scrips: Record<string, number>): string {
  * A fake archive: paths to bodies, plus a record of what was requested.
  *
  * Anything not in `files` answers 404, which is how the real hosts behave for a date the
- * archive does not hold.
+ * archive does not hold. The options each request carried are recorded beside the URLs so
+ * the cache mode the client asks for can be asserted per path.
  */
 function fakeArchive(files: Record<string, string>) {
   const requested: string[] = [];
+  const inits: (RequestInit | undefined)[] = [];
 
-  const fetchImpl = (async (url: string) => {
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
     const href = String(url);
     requested.push(href);
+    inits.push(init);
 
     const marker = "/nepse-data";
     const at = href.indexOf(marker);
@@ -50,7 +54,17 @@ function fakeArchive(files: Record<string, string>) {
       : new Response(body, { status: 200 });
   }) as unknown as typeof fetch;
 
-  return { fetchImpl, requested };
+  return { fetchImpl, requested, inits };
+}
+
+/** The cache mode the client asked for the first request matching `needle`. */
+function cacheModeUsed(
+  requested: readonly string[],
+  inits: readonly (RequestInit | undefined)[],
+  needle: string,
+): RequestCache | undefined {
+  const at = requested.findIndex((url) => url.includes(needle));
+  return at === -1 ? undefined : inits[at]?.cache;
 }
 
 const MANIFEST = JSON.stringify({
@@ -200,6 +214,41 @@ describe("caching", () => {
     await expect(client.session("2026-10-01")).rejects.toThrow();
     // The next call tries again rather than replaying the cached failure.
     await expect(client.session("2026-10-01")).resolves.toBeDefined();
+  });
+});
+
+describe("the cache mode asked of the HTTP layer", () => {
+  /**
+   * The adapter cache and the `inFlight` map are this package's. The browser's HTTP cache
+   * is not, and jsDelivr serves a branch ref with `max-age=604800` — so these assertions
+   * are about the only layer that could serve a week-old `latest` while every test above
+   * still passed.
+   */
+  it("revalidates the files that are rewritten, so a week-old copy cannot be served", async () => {
+    const { fetchImpl, requested, inits } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.manifest();
+    await client.sessions({ from: "2026-09-29", to: "2026-10-01" });
+    await client.directory();
+
+    for (const path of ["latest.json", "sessions.json", "symbols.json"]) {
+      expect(cacheModeUsed(requested, inits, path), path).toBe("no-cache");
+    }
+  });
+
+  it("leaves a session file to the HTTP cache, because it is written once", async () => {
+    const { fetchImpl, requested, inits } = fakeArchive(ARCHIVE);
+    await createClient({ fetch: fetchImpl }).session("2026-10-01");
+
+    expect(cacheModeUsed(requested, inits, "2026-10-01.csv")).toBe("default");
+  });
+
+  it("revalidates a path it does not recognise, rather than trusting it", () => {
+    // The safe direction to be wrong in: an unknown file is assumed to move.
+    expect(cacheModeFor("data/series/NABIL.csv")).toBe("no-cache");
+    expect(cacheModeFor("data/closes/2025.csv")).toBe("no-cache");
+    expect(cacheModeFor("data/daily/2011/2011-06-13.csv")).toBe("default");
   });
 });
 
@@ -417,6 +466,275 @@ describe("sessions and history", () => {
     await client.sessions({ from: "2026-09-28", to: "2026-10-01" });
 
     expect(requested.length).toBe(afterFirst);
+  });
+});
+
+describe("snapshot", () => {
+  it("gives every scrip its day change, from the same two sessions a quote reads", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const market = await client.snapshot();
+
+    expect(market.date).toBe("2026-10-01");
+    expect(market.previousDate).toBe("2026-09-30");
+
+    const nabil = market.rows.find((row) => row.symbol === "NABIL");
+    expect(nabil?.close).toBe(566);
+    expect(nabil?.change).toBe(-4);
+    expect(nabil?.changePercent).toBeCloseTo(-0.7018, 3);
+  });
+
+  it("reports a flat scrip as unchanged, which is not the same as unknown", async () => {
+    // ADBL closed at the same price twice. Zero is a fact; null would be the absence of one.
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const market = await createClient({ fetch: fetchImpl }).snapshot();
+
+    const adbl = market.rows.find((row) => row.symbol === "ADBL");
+    expect(adbl?.change).toBe(0);
+    expect(adbl?.changePercent).toBe(0);
+  });
+
+  it("agrees with quote() for every scrip, because they read the same pair", async () => {
+    // The single-scrip and whole-market answers must not drift; this is the assertion that
+    // would catch it if the shared change maths were ever forked.
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const market = await client.snapshot();
+
+    for (const row of market.rows) {
+      const quote = await client.quote(row.symbol);
+      expect(quote.change, row.symbol).toBe(row.change);
+      expect(quote.changePercent, row.symbol).toBe(row.changePercent);
+    }
+  });
+
+  it("costs three requests however many scrips are asked about", async () => {
+    // What quote-per-holding would cost 3N. This is the whole point of the call.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.snapshot();
+
+    expect(requested).toHaveLength(3);
+  });
+
+  it("reports no change at all when the archive holds a single session", async () => {
+    const { fetchImpl } = fakeArchive({
+      ...ARCHIVE,
+      "data/latest.json": JSON.stringify({
+        latest: "2026-10-01",
+        previous: null,
+        sessions: 1,
+        years: { "2026": 1 },
+      }),
+    });
+    const market = await createClient({ fetch: fetchImpl }).snapshot();
+
+    expect(market.previousDate).toBeNull();
+    expect(market.rows.every((row) => row.change === null)).toBe(true);
+  });
+});
+
+describe("series", () => {
+  const RANGE = { from: "2026-09-29", to: "2026-10-01" };
+
+  it("returns each scrip's series, and agrees with history() for one", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl });
+
+    const both = await client.series(["NABIL", "ADBL"], RANGE);
+
+    expect(await client.history("NABIL", RANGE)).toEqual(both.get("NABIL"));
+    expect(await client.history("ADBL", RANGE)).toEqual(both.get("ADBL"));
+    // ADBL was absent on the 29th, so it contributes no point rather than a null gap.
+    expect(both.get("ADBL")?.map((point) => point.date)).toEqual(["2026-09-30", "2026-10-01"]);
+  });
+
+  it("parses each session once for many scrips, not once per scrip", async () => {
+    // A session body is read from the cache and parsed exactly once per `readThrough` that
+    // returns it, so counting body reads counts parses — which is the cost that `history`
+    // per symbol repeats and this does not. Requests cannot show it: the bodies are cached,
+    // so both paths fetch the same three files.
+    const symbols = ["NABIL", "ADBL", "ACLBSL", "CHCL", "EBL", "SCB"];
+    const bodyReads = (counter: { reads: number }): Cache => {
+      const inner = memoryCache();
+      return {
+        get: async (key) => {
+          if (key.startsWith("session/")) counter.reads += 1;
+          return inner.get(key);
+        },
+        set: (key, value) => inner.set(key, value),
+      };
+    };
+
+    const together = { reads: 0 };
+    const perSymbol = { reads: 0 };
+
+    await createClient({ fetch: fakeArchive(ARCHIVE).fetchImpl, cache: bodyReads(together) }).series(
+      symbols,
+      RANGE,
+    );
+    const oneAtATime = createClient({
+      fetch: fakeArchive(ARCHIVE).fetchImpl,
+      cache: bodyReads(perSymbol),
+    });
+    for (const symbol of symbols) await oneAtATime.history(symbol, RANGE);
+
+    expect(together.reads).toBe(3);
+    expect(perSymbol.reads).toBe(18);
+  });
+
+  it("keeps a key for a ticker the archive has never listed", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const found = await createClient({ fetch: fetchImpl }).series(["GOOGL"], RANGE);
+
+    // Present and empty: a delisted holding should not look like a broken lookup.
+    expect(found.has("GOOGL")).toBe(true);
+    expect(found.get("GOOGL")).toEqual([]);
+  });
+
+  it("normalises case and whitespace and ignores blanks and duplicates", async () => {
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+    const found = await createClient({ fetch: fetchImpl }).series(
+      [" nabil ", "NABIL", "", "   "],
+      RANGE,
+    );
+
+    expect([...found.keys()]).toEqual(["NABIL"]);
+    expect(found.get("NABIL")).toHaveLength(3);
+  });
+
+  it("asks the archive for nothing when asked about nothing", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const found = await createClient({ fetch: fetchImpl }).series([], RANGE);
+
+    expect(found.size).toBe(0);
+    expect(requested).toHaveLength(0);
+  });
+});
+
+describe("history and the archive's series file", () => {
+  const RANGE = { from: "2026-09-29", to: "2026-10-01" };
+
+  /** The same rows a session holds, for one ticker across dates. */
+  function seriesBody(symbol: string, closes: Record<string, number>): string {
+    const rows = Object.entries(closes).map(
+      ([date, close]) =>
+        `${date},${symbol},${close - 2},${close + 3},${close - 5},${close},1000,50000`,
+    );
+    return [HEADER, ...rows].join("\r\n") + "\r\n";
+  }
+
+  const NABIL = { "2026-09-29": 560, "2026-09-30": 570, "2026-10-01": 566 };
+  const WITH_SERIES: Record<string, string> = {
+    ...ARCHIVE,
+    "data/series/NABIL.csv": seriesBody("NABIL", NABIL),
+  };
+
+  it("returns exactly what the session walk returns", async () => {
+    // The assertion this whole feature has to satisfy: the shortcut and the long way round
+    // are two independent paths to one fact, and they must agree.
+    const viaSeries = await createClient({ fetch: fakeArchive(WITH_SERIES).fetchImpl }).history(
+      "NABIL",
+      RANGE,
+    );
+    const viaWalk = await createClient({ fetch: fakeArchive(ARCHIVE).fetchImpl }).history(
+      "NABIL",
+      RANGE,
+    );
+
+    expect(viaSeries).toEqual(viaWalk);
+    expect(viaSeries).toHaveLength(3);
+  });
+
+  it("costs one request for a year's worth of sessions", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+    await createClient({ fetch: fetchImpl }).history("NABIL", RANGE);
+
+    expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(1);
+    expect(requested.filter((url) => url.includes("/data/daily/"))).toHaveLength(0);
+  });
+
+  it("filters the range locally rather than asking for less", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+    const client = createClient({ fetch: fetchImpl });
+
+    const narrower = await client.history("NABIL", { from: "2026-09-30", to: "2026-10-01" });
+
+    expect(narrower.map((point) => point.date)).toEqual(["2026-09-30", "2026-10-01"]);
+    expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(1);
+  });
+
+  it("answers a second range for the same scrip without another request", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.history("NABIL", RANGE);
+    await client.history("NABIL", { from: "2026-10-01", to: "2026-10-01" });
+
+    expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(1);
+  });
+
+  it("falls back to the sessions when the archive publishes no series", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const points = await createClient({ fetch: fetchImpl }).history("NABIL", RANGE);
+
+    expect(points).toHaveLength(3);
+    expect(requested.some((url) => url.includes("data/series/"))).toBe(true);
+    expect(requested.filter((url) => url.includes("/data/daily/"))).toHaveLength(3);
+  });
+
+  it("falls back rather than throwing on a series it cannot read", async () => {
+    // The file is a shortcut, so a broken one must cost speed and nothing else.
+    const { fetchImpl } = fakeArchive({ ...ARCHIVE, "data/series/NABIL.csv": "not a series" });
+    const points = await createClient({ fetch: fetchImpl }).history("NABIL", RANGE);
+
+    expect(points).toHaveLength(3);
+  });
+
+  it("falls back when the series file cannot be reached", async () => {
+    const archive = fakeArchive(ARCHIVE);
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      if (String(url).includes("data/series/")) return new Response("boom", { status: 503 });
+      return archive.fetchImpl(url as never, init);
+    }) as unknown as typeof fetch;
+
+    const points = await createClient({ fetch: fetchImpl, retries: 0 }).history("NABIL", RANGE);
+
+    expect(points).toHaveLength(3);
+  });
+
+  it("remembers an absent series only until the archive might have published one", async () => {
+    // The opposite of a session the market did not trade: this absence is expected to go
+    // away, so it must not be cached forever.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, manifestTtlMs: 0 });
+
+    await client.history("NABIL", RANGE);
+    await client.history("NABIL", RANGE);
+
+    expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(2);
+  });
+
+  it("does not build a path out of a ticker that is not one", async () => {
+    // A typo or a scraped string should take the session walk to its usual answer, not
+    // become a request for a series file that cannot exist.
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+    const points = await createClient({ fetch: fetchImpl }).history("../NABIL", RANGE);
+
+    expect(points).toEqual([]);
+    expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(0);
+  });
+
+  it("still refuses a range that ends before it starts, on the series path", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+
+    await expect(
+      createClient({ fetch: fetchImpl }).history("NABIL", { from: "2026-10-01", to: "2026-09-01" }),
+    ).rejects.toThrow(/before it starts/);
+    expect(requested).toHaveLength(0);
   });
 });
 

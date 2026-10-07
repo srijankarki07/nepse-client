@@ -28,7 +28,15 @@
  * package neither includes nor re-licenses them — see the README.
  */
 
-export { createClient, type ClientOptions, type NepseDataClient, type QuoteResult, type RangeOptions } from "./client.js";
+export {
+  createClient,
+  type ClientOptions,
+  type NepseDataClient,
+  type QuoteResult,
+  type RangeOptions,
+  type SnapshotResult,
+  type SnapshotRow,
+} from "./client.js";
 
 export {
   fileCache,
@@ -44,13 +52,14 @@ export {
   DEFAULT_HOSTS,
   SessionNotFoundError,
   SymbolNotFoundError,
+  cacheModeFor,
   createTransport,
   mapWithConcurrency,
   type Transport,
   type TransportOptions,
 } from "./transport.js";
 
-export { ArchiveFormatError, COLUMNS, parseSessionCsv } from "./csv.js";
+export { ArchiveFormatError, COLUMNS, parseSeriesCsv, parseSessionCsv } from "./csv.js";
 
 export type {
   ArchiveManifest,

@@ -54,6 +54,47 @@ export function memoryCache(): Cache {
   };
 }
 
+/** How much of the quota this cache will use, in UTF-16 bytes. */
+const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Where the write order and size of each key is kept.
+ *
+ * Namespaced because it shares storage with the entries themselves, and the client's keys
+ * are bare strings like `session/2026-10-01`.
+ */
+const INDEX_KEY = "nepse-data:cache-index";
+
+/** One tracked key: its name, and what it costs of the budget. */
+type CacheEntry = [key: string, bytes: number];
+
+/** What a string costs, which is what a quota measures: two bytes per unit. */
+function utf16Bytes(key: string, value: string): number {
+  return 2 * (key.length + value.length);
+}
+
+/**
+ * Every key already in storage, for a cache written before the bookkeeping existed.
+ *
+ * Sizes have to be read back for these, which is the one O(n) read in this adapter and
+ * happens once per storage area rather than once per write.
+ */
+function adopt(store: Storage): CacheEntry[] {
+  const adopted: CacheEntry[] = [];
+
+  try {
+    for (let at = 0; at < store.length; at++) {
+      const key = store.key(at);
+      if (key === null || key === INDEX_KEY) continue;
+      adopted.push([key, utf16Bytes(key, store.getItem(key) ?? "")]);
+    }
+  } catch {
+    return [];
+  }
+
+  return adopted;
+}
+
 /**
  * Survives a reload, for browsers.
  *
@@ -62,23 +103,103 @@ export function memoryCache(): Cache {
  * breaks the application when it is unavailable is worse than no cache, and none of this
  * data is expensive enough to fail over.
  *
- * The quota is real: a full session is around 20 KB and localStorage is typically 5 MB,
- * so a few hundred sessions fit. Writes that overflow simply stop landing.
+ * ## The quota is smaller than the ranges this cache is asked to hold
+ *
+ * A full session is around 18 KB and a year is about 230 of them, so a yearly range is
+ * **~4 MB of compact strings — roughly 8 MB of UTF-16**, against a per-origin quota that is
+ * typically 5 MB. A range that long therefore does not fit, at any point, at any budget.
+ *
+ * The first version of this wrote until the quota refused and then silently stopped
+ * storing, which is the worst of both: the caller is told nothing, "cached forever" becomes
+ * false somewhere in the middle of a range, and which half survived depends on network
+ * timing. So writes are now **budgeted and evicted oldest-first** — the cache holds the
+ * most recent keys that fit and says so by what it keeps, rather than by failing quietly.
+ *
+ * Evicting is cheap here because the browser's HTTP cache sits underneath and holds the
+ * same files for a week on its own; a re-read after an eviction is answered from disk, not
+ * from the network. **That HTTP cache is the layer that actually carries a reload** — this
+ * one is for keys the HTTP cache cannot help with, and for hosts that send no cache headers.
  */
-export function localStorageCache(): Cache {
+export function localStorageCache(options: { maxBytes?: number } = {}): Cache {
+  // Counted in UTF-16 bytes, against a typical 5 MB per-origin quota. Leaving a quarter of
+  // it free keeps a write from being the thing that discovers the limit.
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+
+  const storage = (): Storage | null => {
+    try {
+      return globalThis.localStorage ?? null;
+    } catch {
+      // Accessing the property itself can throw on a blocked origin.
+      return null;
+    }
+  };
+
+  /** The write order and size of each key, so eviction needs no reads of the values. */
+  const readIndex = (): CacheEntry[] => {
+    const store = storage();
+    if (store === null) return [];
+
+    let raw: string | null = null;
+    try {
+      raw = store.getItem(INDEX_KEY);
+    } catch {
+      return [];
+    }
+
+    // No bookkeeping yet: adopt whatever is already there, so a cache written by an earlier
+    // version is evictable rather than occupying the quota for good.
+    if (raw === null) return adopt(store);
+
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (entry): entry is CacheEntry =>
+          Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number",
+      );
+    } catch {
+      return [];
+    }
+  };
+
   return {
     get: async (key) => {
       try {
-        return globalThis.localStorage?.getItem(key) ?? null;
+        return storage()?.getItem(key) ?? null;
       } catch {
         return null;
       }
     },
     set: async (key, value) => {
+      const store = storage();
+      if (store === null) return;
+
       try {
-        globalThis.localStorage?.setItem(key, value);
+        store.setItem(key, value);
       } catch {
         // Full, or blocked. A miss next time is the correct outcome.
+        return;
+      }
+
+      const index = readIndex().filter(([existing]) => existing !== key);
+      index.push([key, utf16Bytes(key, value)]);
+
+      let total = index.reduce((sum, [, size]) => sum + size, 0);
+      while (total > maxBytes && index.length > 1) {
+        const oldest = index.shift();
+        if (oldest === undefined) break;
+        total -= oldest[1];
+        try {
+          store.removeItem(oldest[0]);
+        } catch {
+          // It leaves the index either way, which is what stops the loop.
+        }
+      }
+
+      try {
+        store.setItem(INDEX_KEY, JSON.stringify(index));
+      } catch {
+        // The bookkeeping itself did not fit. The next write rebuilds it by adopting.
       }
     },
   };

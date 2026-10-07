@@ -27,7 +27,7 @@
  */
 
 import { type Cache, memoryCache } from "./cache.js";
-import { ArchiveFormatError, parseSessionCsv } from "./csv.js";
+import { ArchiveFormatError, parseSeriesCsv, parseSessionCsv } from "./csv.js";
 import {
   SessionNotFoundError,
   SymbolNotFoundError,
@@ -51,6 +51,18 @@ const SYMBOLS_PATH = "data/symbols.json";
 const MANIFEST_KEY = "manifest";
 const SESSIONS_KEY = "sessions-index";
 const SYMBOLS_KEY = "symbols-directory";
+
+/**
+ * Where a scrip's whole history lives, when the archive publishes one.
+ *
+ * Optional by design. The archive is free not to publish it, and a client that demanded it
+ * would break against every archive that predates it — so its absence is a fallback, not an
+ * error, and the session walk below stays the path that cannot be wrong.
+ */
+const SERIES_DIRECTORY = "data/series";
+
+/** A ticker that is safe to build a path out of. Junk input takes the session walk. */
+const SERIES_TICKER = /^[A-Z0-9]+$/;
 
 /** How long a manifest may be reused. It changes at most once a day. */
 const DEFAULT_MANIFEST_TTL_MS = 5 * 60 * 1000;
@@ -97,6 +109,24 @@ export interface QuoteResult {
   changePercent: number | null;
 }
 
+/** One scrip in a {@link SnapshotResult}, with its day change. */
+export interface SnapshotRow extends Quote {
+  /** Absolute change against the previous session's close, or `null` when unknown. */
+  change: number | null;
+  /** Change as a percentage, or `null` for the reasons given on `QuoteResult`. */
+  changePercent: number | null;
+}
+
+/** The whole market for the newest session, with every day change worked out. */
+export interface SnapshotResult {
+  /** The session the prices are from. */
+  date: string;
+  /** The session the changes are measured against, or `null` when there is only one. */
+  previousDate: string | null;
+  /** Every scrip the session listed, in the archive's order. */
+  rows: SnapshotRow[];
+}
+
 export interface NepseDataClient {
   /** The index. Read this first; everything else follows from it. */
   manifest(options?: { refresh?: boolean }): Promise<ManifestResult>;
@@ -108,8 +138,39 @@ export interface NepseDataClient {
   sessions(range: RangeOptions): Promise<Session[]>;
   /** The newest price for one scrip, with its day change. */
   quote(symbol: string): Promise<QuoteResult>;
-  /** One scrip's series across a range. Only sessions that listed it appear. */
+  /**
+   * Every scrip in the newest session, each with its day change.
+   *
+   * **This is what a market table, a portfolio or a watchlist should call.** `quote()`
+   * costs three requests for one scrip, so a page holding twenty would spend sixty; this
+   * spends the same three a single quote does and answers for every scrip at once, because
+   * the two session files it reads already hold the whole market.
+   */
+  snapshot(): Promise<SnapshotResult>;
+  /**
+   * One scrip's series across a range. Only sessions that listed it appear.
+   *
+   * When the archive publishes `data/series/<TICKER>.csv` this is **one request** rather
+   * than one per trading day in the range, and the file is read once and kept for the
+   * mutable TTL, so every later range for the same scrip is answered from memory. Against
+   * an archive without one, or when the file cannot be read, it falls back to walking the
+   * sessions — the path that cannot be wrong.
+   */
   history(symbol: string, range: RangeOptions): Promise<DatedQuote[]>;
+  /**
+   * Several scrips' series across one range, in a single pass — what `history()` is for one
+   * scrip.
+   *
+   * The difference is not cosmetic. Each session file is fetched once either way (they are
+   * cached), but `history()` **parses** every one of them per call, so twenty scrips parse
+   * the same bytes twenty times. That is the cost that appears when a caller moves from one
+   * chart to a portfolio.
+   *
+   * Every requested ticker is a key in the result, with an empty array when the archive
+   * never listed it — a delisted holding should not blank the rest of a portfolio, and an
+   * absent key would be indistinguishable from a bug.
+   */
+  series(symbols: readonly string[], range: RangeOptions): Promise<Map<string, DatedQuote[]>>;
   /** Tickers listed in the latest session. */
   symbols(): Promise<string[]>;
   /**
@@ -150,6 +211,27 @@ function sessionPath(date: string): string {
   return `data/daily/${date.slice(0, 4)}/${date}.csv`;
 }
 
+function seriesPath(symbol: string): string {
+  return `${SERIES_DIRECTORY}/${symbol}.csv`;
+}
+
+/**
+ * Refuses a range that is not two usable dates in order.
+ *
+ * Shared, because a range is refused the same way whichever path serves it — and the
+ * series path skips the session walk that used to be the only thing doing this check.
+ */
+function assertRange(range: { from: string; to: string }): void {
+  assertDate(range.from, "range start");
+  assertDate(range.to, "range end");
+
+  if (range.from > range.to) {
+    throw new ArchiveFormatError(
+      `The range ends on ${range.to}, before it starts on ${range.from}.`,
+    );
+  }
+}
+
 /** Every calendar day from `from` to `to`, inclusive. */
 function eachDay(from: string, to: string): string[] {
   const start = Date.parse(`${from}T00:00:00Z`);
@@ -164,6 +246,32 @@ function eachDay(from: string, to: string): string[] {
     days.push(new Date(time).toISOString().slice(0, 10));
   }
   return days;
+}
+
+/**
+ * The change against a previous close, or `null`s when either side is unknown.
+ *
+ * Both sides must be known before a change is a fact. Reporting a fall against an absent
+ * baseline would be an invented figure, and a percentage against a zero previous close is
+ * not a number — rendering either as one would put something on screen that nothing
+ * supports.
+ *
+ * It lives here, rather than inline in `quote`, because `snapshot` reports the same thing
+ * for every scrip at once and the two must not drift apart.
+ */
+function changeAgainst(
+  close: number | null,
+  previousClose: number | null,
+): { change: number | null; changePercent: number | null } {
+  const change =
+    close !== null && previousClose !== null ? Number((close - previousClose).toFixed(4)) : null;
+
+  const changePercent =
+    change !== null && previousClose !== null && previousClose !== 0
+      ? Number(((change / previousClose) * 100).toFixed(4))
+      : null;
+
+  return { change, changePercent };
 }
 
 export function createClient(options: ClientOptions = {}): NepseDataClient {
@@ -344,12 +452,7 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
    * archive answer. It is also what this client did before the date list existed.
    */
   async function datesIn(range: RangeOptions): Promise<string[]> {
-    assertDate(range.from, "range start");
-    assertDate(range.to, "range end");
-
-    if (range.from > range.to) {
-      throw new ArchiveFormatError(`The range ends on ${range.to}, before it starts on ${range.from}.`);
-    }
+    assertRange(range);
 
     const known = await readSessionDates();
     if (known === null) return eachDay(range.from, range.to);
@@ -378,11 +481,21 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     return found.filter((entry): entry is Session => entry !== null);
   }
 
-  async function quote(symbol: string): Promise<QuoteResult> {
+  /**
+   * The newest session and the one before it — what any "how did today go" question needs.
+   *
+   * Shared by `quote` and `snapshot` so that the single-scrip answer and the whole-market
+   * answer are the same answer, by construction rather than by two implementations agreeing.
+   *
+   * A previous session that will not load is not a reason to fail: the changes go to `null`
+   * and the prices still render, which is the call the consumer would otherwise write.
+   */
+  async function latestPair(): Promise<{
+    date: string;
+    current: Session;
+    previous: Session | null;
+  }> {
     const index = await manifest();
-
-    const wanted = symbol.trim().toUpperCase();
-    if (wanted === "") throw new ArchiveFormatError("A symbol is required.");
 
     if (index.latest === null) {
       throw new ArchiveFormatError("The archive is empty — it holds no sessions at all.");
@@ -395,42 +508,168 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
         : session(index.previous).catch(() => null),
     ]);
 
+    return { date: index.latest, current, previous };
+  }
+
+  async function quote(symbol: string): Promise<QuoteResult> {
+    const wanted = symbol.trim().toUpperCase();
+    if (wanted === "") throw new ArchiveFormatError("A symbol is required.");
+
+    const { date, current, previous } = await latestPair();
+
     const quoteRow = current.rows.find((row) => row.symbol === wanted);
     if (quoteRow === undefined) {
       throw new SymbolNotFoundError(
         wanted,
-        `${wanted} is not listed in the ${index.latest} session. It may be suspended, ` +
+        `${wanted} is not listed in the ${date} session. It may be suspended, ` +
           "delisted, or misspelt.",
       );
     }
 
     const previousClose = previous?.rows.find((row) => row.symbol === wanted)?.close ?? null;
-    const close = quoteRow.close;
 
     // Both sides must be known before a change is a fact. Reporting a fall against an
     // absent baseline would be an invented figure.
-    const change =
-      close !== null && previousClose !== null ? Number((close - previousClose).toFixed(4)) : null;
-    const changePercent =
-      change !== null && previousClose !== null && previousClose !== 0
-        ? Number(((change / previousClose) * 100).toFixed(4))
-        : null;
+    return {
+      symbol: wanted,
+      date,
+      quote: quoteRow,
+      previousClose,
+      ...changeAgainst(quoteRow.close, previousClose),
+    };
+  }
 
-    return { symbol: wanted, date: index.latest, quote: quoteRow, previousClose, change, changePercent };
+  async function snapshot(): Promise<SnapshotResult> {
+    const { date, current, previous } = await latestPair();
+
+    // One lookup table for the previous closes, rather than the linear scan `quote` does:
+    // that is the right cost for one scrip and the wrong one for every scrip.
+    const previousCloses = new Map<string, number>();
+    for (const row of previous?.rows ?? []) {
+      if (row.close !== null) previousCloses.set(row.symbol, row.close);
+    }
+
+    return {
+      date,
+      previousDate: previous?.date ?? null,
+      rows: current.rows.map((row) => ({
+        ...row,
+        ...changeAgainst(row.close, previousCloses.get(row.symbol) ?? null),
+      })),
+    };
+  }
+
+  async function series(
+    symbols: readonly string[],
+    range: RangeOptions,
+  ): Promise<Map<string, DatedQuote[]>> {
+    const wanted = new Set<string>();
+    for (const symbol of symbols) {
+      const cleaned = symbol.trim().toUpperCase();
+      if (cleaned !== "") wanted.add(cleaned);
+    }
+
+    // Every ticker asked for is a key, so a caller's loop cannot fall off the end of a
+    // portfolio because one holding is missing from the archive.
+    const found = new Map<string, DatedQuote[]>();
+    for (const symbol of wanted) found.set(symbol, []);
+
+    if (wanted.size === 0) return found;
+
+    // The sessions are parsed once here, which is the whole point: `history` per symbol
+    // would parse these same bytes once per symbol.
+    const all = await sessions(range);
+
+    for (const entry of all) {
+      for (const row of entry.rows) {
+        const bucket = wanted.has(row.symbol) ? found.get(row.symbol) : undefined;
+        if (bucket !== undefined) bucket.push({ ...row, date: entry.date });
+      }
+    }
+
+    return found;
+  }
+
+  /**
+   * A scrip's whole series once read, kept for the mutable TTL.
+   *
+   * Two things are remembered, and both matter: the **parsed rows**, because reading this
+   * file is the entire point and parsing it again per call would give back part of what it
+   * saves; and the **absence** of the file, because until the archive publishes series
+   * files every call would otherwise spend a 404 discovering that again. A `null` value
+   * means "asked, and there was nothing".
+   *
+   * It is held here rather than in the `Cache` deliberately, for the reason spelled out on
+   * `readSessionDates`: with `noCache()` the write goes nowhere and the read always misses,
+   * so a body read back out would be discarded and the client would quietly slide onto the
+   * session walk while believing it was using the series.
+   */
+  const seriesMemo = new Map<string, { rows: DatedQuote[] | null; until: number }>();
+
+  /**
+   * The series file for a ticker, or `null` when the archive publishes none.
+   *
+   * ## Every failure here falls back rather than throwing
+   *
+   * This file is a shortcut over a path that already works, so the honest response to a
+   * missing, malformed, or unreachable one is to walk the sessions and return the same
+   * answer more slowly — never to fail a request that would otherwise have succeeded. The
+   * session walk is loud about its own format errors, so a real breakage still surfaces;
+   * what is swallowed is only the failure of the shortcut.
+   */
+  async function readSeries(symbol: string): Promise<DatedQuote[] | null> {
+    const memo = seriesMemo.get(symbol);
+    if (memo !== undefined && Date.now() < memo.until) return memo.rows;
+
+    try {
+      const body = await transport.get(seriesPath(symbol));
+      const rows = parseSeriesCsv(body, symbol);
+      seriesMemo.set(symbol, { rows, until: Date.now() + manifestTtlMs });
+      return rows;
+    } catch (error) {
+      // An archive that has no series for this ticker yet is worth remembering — but only
+      // for the mutable TTL, because this is an absence that is expected to go away, which
+      // is the opposite of a session the market did not trade.
+      if (error instanceof Error && error.name === "SessionNotFoundError") {
+        seriesMemo.set(symbol, { rows: null, until: Date.now() + manifestTtlMs });
+      }
+      // A network failure, or a file this client cannot read, is not a fact about the
+      // archive and is deliberately not remembered: the next call tries again.
+      return null;
+    }
   }
 
   async function history(symbol: string, range: RangeOptions): Promise<DatedQuote[]> {
     const wanted = symbol.trim().toUpperCase();
     if (wanted === "") throw new ArchiveFormatError("A symbol is required.");
 
-    const all = await sessions(range);
+    assertRange(range);
+    if (range.signal?.aborted === true) return [];
 
-    return all
-      .map((entry) => {
-        const row = entry.rows.find((quote2) => quote2.symbol === wanted);
-        return row === undefined ? null : ({ ...row, date: entry.date } satisfies DatedQuote);
-      })
-      .filter((entry): entry is DatedQuote => entry !== null);
+    if (SERIES_TICKER.test(wanted)) {
+      const rows = await readSeries(wanted);
+
+      if (rows !== null) {
+        // The file is the whole history, so a range is a filter over it rather than a
+        // request for less — one request either way, and the memo then answers every other
+        // range for this scrip without another.
+        const inRange = rows.filter((point) => point.date >= range.from && point.date <= range.to);
+
+        // There is no per-session work to report, but a caller driving a progress bar
+        // should be told the read is done rather than left watching it.
+        range.onProgress?.({
+          done: 1,
+          total: 1,
+          date: inRange.at(-1)?.date ?? range.to,
+        });
+
+        return inRange;
+      }
+    }
+
+    // One bucket of `series`, so a single scrip and a portfolio are filtered by the same
+    // code and cannot disagree about which sessions count.
+    return (await series([wanted], range)).get(wanted) ?? [];
   }
 
   async function symbols(): Promise<string[]> {
@@ -491,7 +730,9 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     latest,
     sessions,
     quote,
+    snapshot,
     history,
+    series,
     symbols,
     directory,
     name,

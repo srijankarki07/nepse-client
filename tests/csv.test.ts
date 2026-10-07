@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { ArchiveFormatError, COLUMNS, parseSessionCsv } from "../src/index.js";
+import { ArchiveFormatError, COLUMNS, parseSeriesCsv, parseSessionCsv } from "../src/index.js";
 
 const HEADER = COLUMNS.join(",");
 
@@ -147,5 +147,68 @@ describe("COLUMNS", () => {
       "volume",
       "turnover",
     ]);
+  });
+});
+
+describe("parseSeriesCsv", () => {
+  it("reads one scrip's whole history", () => {
+    const series = parseSeriesCsv(
+      body(row("2026-09-30", "NABIL"), row("2026-10-01", "NABIL")),
+      "NABIL",
+    );
+
+    expect(series.map((point) => point.date)).toEqual(["2026-09-30", "2026-10-01"]);
+    expect(series.map((point) => point.close)).toEqual([105, 105]);
+  });
+
+  it("puts the points in date order whatever order the file is in", () => {
+    // A chart's x-axis must ascend, and `history()` has to return the same thing from this
+    // path as from the session walk, which is ascending by construction.
+    const series = parseSeriesCsv(
+      body(row("2026-10-01", "NABIL"), row("2026-09-29", "NABIL"), row("2026-09-30", "NABIL")),
+      "NABIL",
+    );
+
+    expect(series.map((point) => point.date)).toEqual([
+      "2026-09-29",
+      "2026-09-30",
+      "2026-10-01",
+    ]);
+  });
+
+  it("refuses a series belonging to another ticker", () => {
+    // The same guard the session reader applies to dates: a file served under the wrong
+    // name would file one company's prices under another's, and nothing downstream could
+    // tell.
+    const wrongScrip = body(row("2026-10-01", "ADBL"));
+
+    expect(() => parseSeriesCsv(wrongScrip, "NABIL")).toThrow(/describes ADBL/);
+    expect(() => parseSeriesCsv(wrongScrip, "NABIL")).toThrow(ArchiveFormatError);
+  });
+
+  it("matches the ticker without caring about case", () => {
+    const series = parseSeriesCsv(body(row("2026-10-01", "nabil")), "nabil");
+    expect(series).toHaveLength(1);
+  });
+
+  it("refuses a row whose column count changed", () => {
+    const mangled = [HEADER, "2026-10-01,NABIL,100,110,90,105,1000"].join("\r\n");
+    expect(() => parseSeriesCsv(mangled, "NABIL")).toThrow(/expected 8/);
+  });
+
+  it("refuses a body with no rows at all", () => {
+    expect(() => parseSeriesCsv(HEADER, "NABIL")).toThrow(/no series rows/);
+    expect(() => parseSeriesCsv("", "NABIL")).toThrow(/no series rows/);
+  });
+
+  it("keeps an empty field absent rather than zero", () => {
+    const series = parseSeriesCsv(
+      body(row("2026-10-01", "HALTED", { high: "", volume: "" })),
+      "HALTED",
+    );
+
+    expect(series[0]?.high).toBeNull();
+    expect(series[0]?.volume).toBeNull();
+    expect(series[0]?.close).toBe(105);
   });
 });
