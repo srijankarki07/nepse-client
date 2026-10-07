@@ -129,6 +129,12 @@ instead of one per trading day: measured over a year, 231 requests and 4.13 MB b
 request for the file. The file is read once and kept for `manifestTtlMs`, so every later
 range for the same scrip is answered from memory rather than the network.
 
+A ticker is not always a filename. Fourteen of them contain a slash, because the source
+names a debenture for the two years it covers: `GBILD86/87` is written as
+`data/series/GBILD86-87.csv`, and the rows inside still carry the real ticker. The rule is
+that every run of characters outside `A-Za-z0-9` becomes one `-`, and both this package and
+the archive apply it, with a test on this side asserting that the two agree.
+
 An archive that publishes no series files, or one whose file cannot be read, falls back
 to walking the sessions, which is the path that cannot be wrong. A series file served under
 the wrong ticker is refused rather than believed, the same way a session file describing

@@ -61,8 +61,8 @@ const SYMBOLS_KEY = "symbols-directory";
  */
 const SERIES_DIRECTORY = "data/series";
 
-/** A ticker that is safe to build a path out of. Junk input takes the session walk. */
-const SERIES_TICKER = /^[A-Z0-9]+$/;
+/** A ticker worth naming a file after: letters, digits, and the slash a bond code uses. */
+const SERIES_TICKER = /^[A-Z0-9/]+$/;
 
 /** How long a manifest may be reused. It changes at most once a day. */
 const DEFAULT_MANIFEST_TTL_MS = 5 * 60 * 1000;
@@ -211,8 +211,30 @@ function sessionPath(date: string): string {
   return `data/daily/${date.slice(0, 4)}/${date}.csv`;
 }
 
-function seriesPath(symbol: string): string {
-  return `${SERIES_DIRECTORY}/${symbol}.csv`;
+/**
+ * A ticker as the archive names its series file, or `null` when it is not one.
+ *
+ * Fourteen tickers in the archive contain a slash, because the source names a debenture
+ * for the two years it covers: `GBILD86/87` is one ticker, but as a path it would be a
+ * directory called `GBILD86` holding `87.csv`. So every run of characters outside
+ * `A-Za-z0-9` becomes one `-`, and the result is upper-cased.
+ *
+ * The archive writes the same name from the same ticker
+ * (`nepse-data/src/lib/series.ts`), and a test here asserts the two agree. This is the one
+ * rule that could silently disagree, and its failure mode is quiet: every read would go to
+ * a file that is not there and fall back to the slow path, which looks exactly like an
+ * archive that publishes no series files at all.
+ */
+function seriesName(symbol: string): string | null {
+  if (!SERIES_TICKER.test(symbol)) return null;
+
+  const name = symbol
+    .replace(/[^A-Za-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toUpperCase();
+
+  // A ticker of nothing but slashes passes the pattern and names nothing.
+  return name === "" ? null : name;
 }
 
 /**
@@ -621,8 +643,14 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     const memo = seriesMemo.get(symbol);
     if (memo !== undefined && Date.now() < memo.until) return memo.rows;
 
+    // Not a ticker the archive would have named a file after — a misspelling, or a string
+    // with a path separator in it. The session walk answers it instead, and this costs
+    // nothing, so there is no separate guard at the call site to keep in step.
+    const name = seriesName(symbol);
+    if (name === null) return null;
+
     try {
-      const body = await transport.get(seriesPath(symbol));
+      const body = await transport.get(`${SERIES_DIRECTORY}/${name}.csv`);
       const rows = parseSeriesCsv(body, symbol);
       seriesMemo.set(symbol, { rows, until: Date.now() + manifestTtlMs });
       return rows;
@@ -646,25 +674,23 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     assertRange(range);
     if (range.signal?.aborted === true) return [];
 
-    if (SERIES_TICKER.test(wanted)) {
-      const rows = await readSeries(wanted);
+    const rows = await readSeries(wanted);
 
-      if (rows !== null) {
-        // The file is the whole history, so a range is a filter over it rather than a
-        // request for less — one request either way, and the memo then answers every other
-        // range for this scrip without another.
-        const inRange = rows.filter((point) => point.date >= range.from && point.date <= range.to);
+    if (rows !== null) {
+      // The file is the whole history, so a range is a filter over it rather than a
+      // request for less — one request either way, and the memo then answers every other
+      // range for this scrip without another.
+      const inRange = rows.filter((point) => point.date >= range.from && point.date <= range.to);
 
-        // There is no per-session work to report, but a caller driving a progress bar
-        // should be told the read is done rather than left watching it.
-        range.onProgress?.({
-          done: 1,
-          total: 1,
-          date: inRange.at(-1)?.date ?? range.to,
-        });
+      // There is no per-session work to report, but a caller driving a progress bar
+      // should be told the read is done rather than left watching it.
+      range.onProgress?.({
+        done: 1,
+        total: 1,
+        date: inRange.at(-1)?.date ?? range.to,
+      });
 
-        return inRange;
-      }
+      return inRange;
     }
 
     // One bucket of `series`, so a single scrip and a portfolio are filtered by the same
