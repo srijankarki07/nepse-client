@@ -85,8 +85,8 @@ One session, whole market: `{ date, rows }`. `latest()` is the newest.
 Every session in a calendar range, ascending. Days the market was shut are skipped.
 
 > **This is the expensive call**, though less so than it was. The archive publishes a date
-> list, so a year costs **one request to learn which days traded, plus one per session** —
-> measured at **231 requests and 4.13 MB** for a year, returning 230 sessions. Sessions are
+> list, so a year costs **one request to learn which days traded, plus one per session**. That
+> is **231 requests and 4.13 MB** for a year, returning 230 sessions. Sessions are
 > cached permanently once read, so the second call over the same range costs nothing at all.
 >
 > It is the right call only when you want the **whole market** across a range. For one
@@ -123,13 +123,13 @@ The change rules are `quote()`'s, from the same code: `null` unless both sides a
 One scrip's series over a range. Sessions where it did not trade contribute no point,
 never a `null` gap.
 
-When the archive publishes `data/series/<TICKER>.csv` — one scrip's whole history in the
-same eight columns as a session file, ascending by date — this becomes **one request**
+When the archive publishes `data/series/<TICKER>.csv` (one scrip's whole history in the
+same eight columns as a session file, ascending by date), this becomes **one request**
 instead of one per trading day: measured over a year, 231 requests and 4.13 MB become one
 request for the file. The file is read once and kept for `manifestTtlMs`, so every later
 range for the same scrip is answered from memory rather than the network.
 
-An archive that publishes no series files — or one whose file cannot be read — falls back
+An archive that publishes no series files, or one whose file cannot be read, falls back
 to walking the sessions, which is the path that cannot be wrong. A series file served under
 the wrong ticker is refused rather than believed, the same way a session file describing
 another day is.
@@ -139,7 +139,7 @@ another day is.
 Several scrips' series in a single pass, as a `Map` from ticker to that ticker's points.
 
 The sessions are parsed **once** for the whole set. `history()` per symbol fetches the same
-files — they are cached — but parses them again for every symbol, which is the cost that
+files (they are cached) but parses them again for every symbol, which is the cost that
 turns up when a caller moves from one chart to a portfolio. Measured over a year: five
 symbols cost **137 ms** here against **636 ms** as five `history()` calls, and the gap
 grows with the set.
@@ -188,7 +188,7 @@ it traded at nothing.
 **The index, the date list and the directory are re-fetched conditionally, on purpose.**
 Those three are the only files the archive rewrites. jsDelivr serves a branch with
 `cache-control: max-age=604800`, so a browser would otherwise reuse a week-old `latest.json`
-without asking — a week-old close on screen, and a chart missing its newest sessions, with
+without asking: a week-old close on screen, and a chart missing its newest sessions, with
 nothing to indicate it. Session files are immutable and are still cached hard. The
 revalidation is a conditional request both hosts answer with `304` and no body, so it costs
 a round trip and no bytes.
