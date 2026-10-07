@@ -799,6 +799,141 @@ describe("history and the archive's series file", () => {
   });
 });
 
+describe("closes and the archive's per-year file", () => {
+  const RANGE = { from: "2026-09-29", to: "2026-10-01" };
+
+  /** A year of the whole market, wide: one row per date, one column per ticker. */
+  const closesBody = (...lines: string[]) => lines.join("\r\n") + "\r\n";
+
+  const WITH_CLOSES: Record<string, string> = {
+    ...ARCHIVE,
+    "data/closes/2026.csv": closesBody(
+      "date,ADBL,NABIL",
+      "2026-09-29,,560",
+      "2026-09-30,307.5,570",
+      "2026-10-01,307.5,566",
+    ),
+    "data/closes/2025.csv": closesBody("date,NABIL", "2025-12-31,500"),
+  };
+
+  it("reads a year of the whole market in one request", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_CLOSES);
+    const rows = await createClient({ fetch: fetchImpl }).closes(RANGE);
+
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(1);
+    // Not one request per session, which is what this replaces.
+    expect(requested.filter((url) => url.includes("/data/daily/"))).toHaveLength(0);
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-29", "2026-09-30", "2026-10-01"]);
+    expect(rows[0]?.closes.get("NABIL")).toBe(560);
+    expect(rows[2]?.closes.get("ADBL")).toBe(307.5);
+    // ADBL did not trade on the 29th, so it is absent rather than present as a null.
+    expect(rows[0]?.closes.has("ADBL")).toBe(false);
+  });
+
+  it("agrees with what the sessions say, date for date and scrip for scrip", async () => {
+    // The invariant the whole file rests on: it is derived from the sessions, so the two must
+    // produce the same thing. This is what would catch a column being read out of position.
+    const viaCloses = await createClient({ fetch: fakeArchive(WITH_CLOSES).fetchImpl }).closes(
+      RANGE,
+    );
+    const sessions = await createClient({ fetch: fakeArchive(ARCHIVE).fetchImpl }).sessions(RANGE);
+    const viaSessions = sessions.map((session) => ({
+      date: session.date,
+      closes: new Map(
+        session.rows.flatMap((row) =>
+          row.close === null ? [] : [[row.symbol, row.close] as [string, number]],
+        ),
+      ),
+    }));
+
+    expect(viaCloses).toEqual(viaSessions);
+  });
+
+  it("costs one request per calendar year the range covers", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_CLOSES);
+    const rows = await createClient({ fetch: fetchImpl }).closes({
+      from: "2025-12-01",
+      to: "2026-10-01",
+    });
+
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(2);
+    expect(requested.filter((url) => url.endsWith("2025.csv"))).toHaveLength(1);
+    expect(requested.filter((url) => url.endsWith("2026.csv"))).toHaveLength(1);
+    expect(rows.map((row) => row.date)).toEqual([
+      "2025-12-31",
+      "2026-09-29",
+      "2026-09-30",
+      "2026-10-01",
+    ]);
+  });
+
+  it("filters the range locally rather than asking for less", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_CLOSES);
+    const rows = await createClient({ fetch: fetchImpl }).closes({
+      from: "2026-09-30",
+      to: "2026-09-30",
+    });
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-30"]);
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(1);
+  });
+
+  it("answers a second range for the same year without another request", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_CLOSES);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.closes(RANGE);
+    await client.closes({ from: "2026-10-01", to: "2026-10-01" });
+
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(1);
+  });
+
+  it("falls back to the sessions when the archive publishes no closes for a year", async () => {
+    // The path that cannot be wrong. A range is answered whole or not at all: a caller given
+    // a gap would read it as a market that had been shut.
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const rows = await createClient({ fetch: fetchImpl }).closes(RANGE);
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-29", "2026-09-30", "2026-10-01"]);
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(1);
+    expect(requested.filter((url) => url.includes("/data/daily/"))).toHaveLength(3);
+  });
+
+  it("falls back for the whole range when only one year is missing", async () => {
+    const partial = { ...WITH_CLOSES };
+    delete partial["data/closes/2025.csv"];
+    const { fetchImpl } = fakeArchive(partial);
+
+    const rows = await createClient({ fetch: fetchImpl }).closes({
+      from: "2025-12-01",
+      to: "2026-10-01",
+    });
+
+    // The year it has is not enough: the answer would be missing 2025 entirely.
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-29", "2026-09-30", "2026-10-01"]);
+  });
+
+  it("remembers an absent year only until the archive might publish one", async () => {
+    const { fetchImpl, requested } = fakeArchive(ARCHIVE);
+    const client = createClient({ fetch: fetchImpl, manifestTtlMs: 0 });
+
+    await client.closes(RANGE);
+    await client.closes(RANGE);
+
+    expect(requested.filter((url) => url.includes("data/closes/"))).toHaveLength(2);
+  });
+
+  it("refuses a range that ends before it starts, on either path", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_CLOSES);
+
+    await expect(
+      createClient({ fetch: fetchImpl }).closes({ from: "2026-10-01", to: "2026-09-01" }),
+    ).rejects.toThrow(/before it starts/);
+    expect(requested).toHaveLength(0);
+  });
+});
+
 describe("sessionDates", () => {
   it("lists the sessions in a range without fetching any of them", async () => {
     const { fetchImpl, requested } = fakeArchive(ARCHIVE);

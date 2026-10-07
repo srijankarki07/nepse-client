@@ -164,6 +164,49 @@ describe("the real archive", () => {
     expect(elapsed, `took ${elapsed}ms at concurrency ${DEFAULT_CONCURRENCY}`).toBeLessThan(15_000);
   });
 
+  it(
+    "reads a year of the market the same way from closes files as from the sessions",
+    { timeout: NETWORK_TEST_TIMEOUT_MS },
+    async ({ skip }) => {
+      // The same two-paths check as the series file above, for the other index: whatever a
+      // consumer computes from closes() has to be what it would have computed from the
+      // sessions. Where the archive publishes no closes file there is nothing to compare.
+      const manifest = await client.manifest();
+      if (manifest.latest === null) throw new Error("the archive is empty");
+
+      const year = manifest.latest.slice(0, 4);
+
+      const published = await createTransport({ hosts: DEFAULT_HOSTS })
+        .get(`data/closes/${year}.csv`)
+        .then(() => true)
+        .catch(() => false);
+
+      if (!published) {
+        skip(`the archive publishes no closes file for ${year} yet`);
+        return;
+      }
+
+      const to = manifest.latest;
+      const from = new Date(Date.parse(`${to}T00:00:00Z`) - 90 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      const range = { from, to };
+
+      const viaFiles = await client.closes(range);
+      const viaSessions = (await client.sessions(range)).map((session) => ({
+        date: session.date,
+        closes: new Map(
+          session.rows.flatMap((row) =>
+            row.close === null ? [] : [[row.symbol, row.close] as [string, number]],
+          ),
+        ),
+      }));
+
+      expect(viaFiles.length).toBeGreaterThan(20);
+      expect(viaFiles).toEqual(viaSessions);
+    },
+  );
+
   it("reports a date the archive does not hold as absent", async () => {
     // April 2020 is the safest genuinely empty period the archive has: NEPSE halted
     // trading for the COVID lockdown and the whole month has no sessions at all.

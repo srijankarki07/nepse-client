@@ -37,7 +37,7 @@
  * against the ticker.
  */
 
-import type { DatedQuote, Quote } from "./types.js";
+import type { DatedCloses, DatedQuote, Quote } from "./types.js";
 
 /** The archive's column order. Exported so a consumer can assert against it. */
 export const COLUMNS = [
@@ -215,6 +215,101 @@ export function parseSessionCsv(csv: string, expectedDate?: string): Quote[] {
   return rows.map((row) => row.quote);
 }
 
+/**
+ * One year's closes file: `data/closes/<YEAR>.csv`, when the archive publishes one.
+ *
+ * This is the one file here that is **not** in the session format. It is wide where the
+ * others are long: one row per date and one column per ticker, which is what makes a year of
+ * the whole market fit in about 450 KB instead of the megabytes the same facts occupy as
+ * session files. The columns are the tickers listed at any point in the year, and a cell is
+ * empty for a scrip that did not trade that day.
+ *
+ * So the checks differ accordingly. There is no fixed field count to assert, because the
+ * count is however many tickers that year saw; what is asserted instead is that every row
+ * agrees with the header about how many columns there are, and that the file describes the
+ * year that was asked for. The second is the same guard the session reader applies to its
+ * date and the series reader to its ticker: a file served under another year's name would
+ * otherwise be filed under the wrong one.
+ *
+ * Empty cells are skipped rather than kept as anything. A close that was not published has no
+ * ratio against the previous day, so a caller must not be able to count it as one.
+ */
+export function parseClosesCsv(csv: string, expectedYear: string): DatedCloses[] {
+  const lines = csv.split(/\r?\n/).filter((line) => line !== "");
+  const header = lines[0];
+
+  if (header === undefined) {
+    throw new ArchiveFormatError(
+      "The body held no closes rows. An empty year is not something the archive publishes " +
+        "— a year the market did not trade has no file at all.",
+    );
+  }
+
+  const columns = header.split(",");
+  const first = columns[0]?.trim();
+
+  // A session file is the one thing that could reach here by mistake, and it would parse
+  // without complaint: its header also starts with `date` and names more than one column, so
+  // every row would read as a date plus seven tickers called "symbol", "open" and so on.
+  // Refusing it by name is cheaper than trusting that nothing ever mixes the paths up.
+  if (header.trim() === COLUMNS.join(",")) {
+    throw new ArchiveFormatError(
+      "This is a session file, not a closes file. The archive serves closes at " +
+        "data/closes/<YEAR>.csv and sessions at data/daily/<YEAR>/<DATE>.csv.",
+    );
+  }
+
+  if (first !== "date" || columns.length < 2) {
+    throw new ArchiveFormatError(
+      `A closes header must start with "date" and name at least one ticker, but reads ` +
+        `"${header.slice(0, 60)}". The archive's format has changed, or this is not a ` +
+        "closes file.",
+    );
+  }
+
+  // The ticker names are taken once, so a row is read by position rather than by rebuilding
+  // the mapping for every date.
+  const symbols = columns.slice(1).map((symbol) => symbol.trim());
+
+  const rows: DatedCloses[] = [];
+
+  for (let index = 1; index < lines.length; index++) {
+    const line = lines[index] ?? "";
+    const fields = line.split(",");
+
+    if (fields.length !== columns.length) {
+      throw new ArchiveFormatError(
+        `A closes row has ${fields.length} columns, expected ${columns.length} to match the ` +
+          "header. The archive's format has changed, or the file is damaged.",
+      );
+    }
+
+    const date = (fields[0] ?? "").trim();
+    if (!DATE_PATTERN.test(date)) {
+      throw new ArchiveFormatError(`A closes row carries an unusable date: "${date}".`);
+    }
+
+    if (!date.startsWith(`${expectedYear}-`)) {
+      throw new ArchiveFormatError(
+        `Asked for ${expectedYear} but the file describes ${date}. The archive returned the ` +
+          "wrong year, so none of these closes belong to the dates requested.",
+      );
+    }
+
+    const closes = new Map<string, number>();
+    for (let column = 0; column < symbols.length; column++) {
+      const symbol = symbols[column];
+      if (symbol === undefined || symbol === "") continue;
+
+      const value = parseNumber(fields[column + 1] ?? "");
+      if (value !== null) closes.set(symbol, value);
+    }
+
+    rows.push({ date, closes });
+  }
+
+  return rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
 /**
  * One scrip's series file: `data/series/<TICKER>.csv`, when the archive publishes one.
  *

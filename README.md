@@ -90,8 +90,8 @@ Every session in a calendar range, ascending. Days the market was shut are skipp
 > cached permanently once read, so the second call over the same range costs nothing at all.
 >
 > It is the right call only when you want the **whole market** across a range. For one
-> scrip use `history()`, for a handful use `series()`, and for the newest prices alone use
-> `snapshot()`.
+> scrip use `history()`, for a handful use `series()`, for the whole market's closes use
+> `closes()`, and for the newest prices alone use `snapshot()`.
 >
 > Where the archive publishes no date list, the client falls back to walking calendar days
 > and probing each one. Slower, and kept because it is the path that cannot be wrong.
@@ -153,6 +153,28 @@ grows with the set.
 Every ticker asked for is a key in the result, with an empty array when the archive never
 listed it. A delisted holding should not blank the rest of a portfolio, and an absent key
 would be indistinguishable from a bug.
+
+### `closes({ from, to })`
+
+Every scrip's closing price for every session in a range, ascending: `{ date, closes }`, where
+`closes` is a `Map` from ticker to close.
+
+**This is what a market-wide chart should read.** `sessions()` costs one request per trading
+day, which is 231 requests and 4.13 MB for a year; this costs **one request per calendar year
+the range covers**, about 450 KB each, because the archive publishes a year of closes as a
+single wide file. Measured over a year against the live archive: **232 requests and 4.13 MB
+become 2 requests and 790 KB**, and the two paths agree on all 78,064 `(date, scrip, close)`
+values they hold. An equal-weighted index, a heatmap, or a portfolio's daily values can all be
+computed from what it returns.
+
+Scrips that did not trade, or that published no close, are **absent** from that date's map
+rather than present with a `null`. Neither has a ratio against the previous day, and an absent
+key cannot be mistaken for a zero.
+
+It carries closes only, by design. For one scrip with its open, high, low, volume and turnover,
+use `history()`; for a handful of scrips, `series()`. **For more than two or three, this is
+cheaper than `series()`**: a year of the whole market is one 450 KB request, where three scrips
+would be three files of roughly 180 KB each.
 
 ### `symbols()`
 
