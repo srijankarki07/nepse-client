@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { createClient, DEFAULT_CONCURRENCY, noCache } from "../src/index.js";
+import { DEFAULT_CONCURRENCY, DEFAULT_HOSTS, createClient, createTransport, noCache } from "../src/index.js";
 
 const client = createClient({ cache: noCache() });
 
@@ -80,6 +80,51 @@ describe("the real archive", () => {
     expect(series.at(-1)?.close).toBe(quote.quote.close);
     expect(series[0]?.close).toBe(quote.previousClose);
   });
+
+  it(
+    "reads one scrip the same way from a series file as from the sessions",
+    { timeout: NETWORK_TEST_TIMEOUT_MS },
+    async ({ skip }) => {
+      // The shortcut and the long way round are two independent paths to one fact, so they
+      // have to agree on real bytes and not only on fixtures. Where the archive publishes
+      // no series file — which is where it starts — there is nothing to compare, and this
+      // says so rather than passing quietly on a path it never took.
+      const manifest = await client.manifest();
+      if (manifest.latest === null) throw new Error("the archive is empty");
+
+      const symbol = (await client.latest()).rows[0]?.symbol;
+      if (symbol === undefined) throw new Error("the newest session listed nothing");
+
+      // Asked of the transport directly, so whether the file exists is not decided by the
+      // code this test is about.
+      const published = await createTransport({ hosts: DEFAULT_HOSTS })
+        .get(`data/series/${symbol}.csv`)
+        .then(() => true)
+        .catch(() => false);
+
+      if (!published) {
+        skip(`the archive publishes no series file for ${symbol} yet`);
+        return;
+      }
+
+      const to = manifest.latest;
+      const from = new Date(Date.parse(`${to}T00:00:00Z`) - 30 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      const range = { from, to };
+
+      const viaSeries = await client.history(symbol, range);
+      const viaWalk = (await client.sessions(range))
+        .map((entry) => {
+          const row = entry.rows.find((candidate) => candidate.symbol === symbol);
+          return row === undefined ? null : { ...row, date: entry.date };
+        })
+        .filter((point) => point !== null);
+
+      expect(viaSeries.length).toBeGreaterThan(0);
+      expect(viaSeries).toEqual(viaWalk);
+    },
+  );
 
   it("reads a whole range and returns it ascending, without gaps", { timeout: NETWORK_TEST_TIMEOUT_MS }, async () => {
     const manifest = await client.manifest();

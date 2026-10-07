@@ -102,6 +102,42 @@ export const DEFAULT_CONCURRENCY = 6;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RETRIES = 2;
 
+/**
+ * Which fetch cache mode a path should be read with.
+ *
+ * ## There are three caches, and only two of them were being told what to do
+ *
+ * The `Cache` adapter and the client's `inFlight` map are this package's own. The third is
+ * the browser's HTTP cache, underneath `fetch`, and it is the one that was lying.
+ *
+ * jsDelivr serves a branch ref with `cache-control: public, max-age=604800` — measured on
+ * `latest.json`, `sessions.json` and `symbols.json`, the three files that move. A browser
+ * may therefore reuse any of them for seven days *without revalidating*, and no option this
+ * package accepts can override a layer it does not control: `manifestTtlMs` calls `fetch`
+ * again and the HTTP cache answers from disk.
+ *
+ * That is a correctness problem rather than a performance one. A week-old `latest.json` is
+ * a week-old close on screen, and a week-old `sessions.json` is a chart missing its newest
+ * sessions — both silently, and both looking exactly like an archive that simply has no
+ * newer data.
+ *
+ * So the policy is declared per path, and it is the same rule the adapter cache already
+ * follows: **immutable caches hard, mutable revalidates.** `no-cache` does not mean "do not
+ * cache" — it means "revalidate before reuse", and both hosts send an `ETag`, so an
+ * unchanged file costs one conditional request answered with a `304` and a body of nothing.
+ */
+export function cacheModeFor(path: string): "default" | "no-cache" {
+  // A session file is written once and never rewritten, so the HTTP cache may hold it for
+  // as long as it likes. This tree carries every long-range read, which is where holding it
+  // is worth the most.
+  if (path.startsWith("data/daily/")) return "default";
+
+  // Everything else is rewritten in place: the index, the date list, the ticker directory,
+  // and the per-symbol series files. Revalidating is the safe default for a path this
+  // package does not recognise, too.
+  return "no-cache";
+}
+
 /** Runs `worker` over `items`, at most `limit` at a time, preserving order. */
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
@@ -150,6 +186,9 @@ export function createTransport(options: TransportOptions = {}): Transport {
   async function getFromHost(host: string, path: string): Promise<string> {
     const response = await doFetch(`${host}/${path}`, {
       headers: { accept: "*/*" },
+      // Stated per path rather than left to the browser's default, which for a branch ref
+      // is a week. See `cacheModeFor`.
+      cache: cacheModeFor(path),
       signal: AbortSignal.timeout(timeoutMs),
     });
 

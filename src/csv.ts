@@ -27,9 +27,17 @@
  * The archive writes CRLF (RFC 4180, and `.gitattributes` stops git rewriting it). Lines
  * are split on either ending here, because being strict about it would fail on a file
  * that had been through a tool that normalised it, and the difference carries no meaning.
+ *
+ * ## A series file is the same rows, grouped by scrip
+ *
+ * `data/series/<TICKER>.csv`, when the archive publishes one, holds a single scrip's rows
+ * for its whole history in this same eight-column shape. It is read by the same loop, so
+ * the two cannot disagree about what a valid row is; what differs is the check applied to
+ * each row — a session row is verified against the date that was asked for, a series row
+ * against the ticker.
  */
 
-import type { Quote } from "./types.js";
+import type { DatedQuote, Quote } from "./types.js";
 
 /** The archive's column order. Exported so a consumer can assert against it. */
 export const COLUMNS = [
@@ -78,19 +86,34 @@ function parseNumber(raw: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+/** One parsed row, with the session it belongs to. */
+interface ParsedRow {
+  date: string;
+  quote: Quote;
+}
+
+interface RowChecks {
+  /** Refuse a row that is not from this session. */
+  expectedDate?: string;
+  /** Refuse a row that is not this scrip. */
+  expectedSymbol?: string;
+  /** What to say when the body held no rows at all — it differs by what was being read. */
+  emptyMessage: string;
+}
+
 /**
- * One session file's rows.
+ * The row loop, shared by both readers.
  *
- * `expectedDate` is optional so the parser can be used on a body whose session is not
- * known in advance, but every caller in this package passes it: the whole point is to
- * refuse a file that is not the session it was asked for.
+ * A series file is the same eight columns in the same order, so the structural checks —
+ * the header, the field count, the usable date — are the same checks, and having one copy
+ * of them is what stops the two readers disagreeing about what a valid row is. The wording
+ * of those errors names the session format, which is the format a series file is in.
  */
-export function parseSessionCsv(csv: string, expectedDate?: string): Quote[] {
+function parseRows(csv: string, checks: RowChecks): ParsedRow[] {
   const lines = csv.split(/\r?\n/);
 
-  const rows: Quote[] = [];
+  const rows: ParsedRow[] = [];
   let sawHeader = false;
-  let sawAnyRow = false;
 
   for (const line of lines) {
     if (line.trim() === "") continue;
@@ -125,9 +148,9 @@ export function parseSessionCsv(csv: string, expectedDate?: string): Quote[] {
       throw new ArchiveFormatError(`A session row carries an unusable date: "${date}".`);
     }
 
-    if (expectedDate !== undefined && date !== expectedDate) {
+    if (checks.expectedDate !== undefined && date !== checks.expectedDate) {
       throw new ArchiveFormatError(
-        `Asked for ${expectedDate} but the file describes ${date}. The archive returned ` +
+        `Asked for ${checks.expectedDate} but the file describes ${date}. The archive returned ` +
           "the wrong session, so none of these prices belong to the date requested.",
       );
     }
@@ -139,27 +162,78 @@ export function parseSessionCsv(csv: string, expectedDate?: string): Quote[] {
       continue;
     }
 
-    sawAnyRow = true;
+    // The same guard as the date above, for the other thing a file can be wrong about: a
+    // series served under another ticker's name would file one company's prices under
+    // another's, and nothing downstream could tell.
+    if (checks.expectedSymbol !== undefined && symbol !== checks.expectedSymbol) {
+      throw new ArchiveFormatError(
+        `Asked for ${checks.expectedSymbol} but the file describes ${symbol}. The archive ` +
+          "returned another scrip's series, so none of these prices belong to the ticker " +
+          "requested.",
+      );
+    }
 
     rows.push({
-      symbol,
-      open: parseNumber(fields[OPEN_FIELD] ?? ""),
-      high: parseNumber(fields[HIGH_FIELD] ?? ""),
-      low: parseNumber(fields[LOW_FIELD] ?? ""),
-      close: parseNumber(fields[CLOSE_FIELD] ?? ""),
-      volume: parseNumber(fields[VOLUME_FIELD] ?? ""),
-      turnover: parseNumber(fields[TURNOVER_FIELD] ?? ""),
+      date,
+      quote: {
+        symbol,
+        open: parseNumber(fields[OPEN_FIELD] ?? ""),
+        high: parseNumber(fields[HIGH_FIELD] ?? ""),
+        low: parseNumber(fields[LOW_FIELD] ?? ""),
+        close: parseNumber(fields[CLOSE_FIELD] ?? ""),
+        volume: parseNumber(fields[VOLUME_FIELD] ?? ""),
+        turnover: parseNumber(fields[TURNOVER_FIELD] ?? ""),
+      },
     });
   }
 
-  if (!sawAnyRow) {
+  if (rows.length === 0) {
     // Distinguished from "a session with no rows", which does not exist: a session the
     // market did not trade simply has no file, and asking for one is a 404.
-    throw new ArchiveFormatError(
-      "The body held no session rows. An empty session is not something the archive " +
-        "publishes — a day the market did not trade has no file at all.",
-    );
+    throw new ArchiveFormatError(checks.emptyMessage);
   }
 
   return rows;
+}
+
+/**
+ * One session file's rows.
+ *
+ * `expectedDate` is optional so the parser can be used on a body whose session is not
+ * known in advance, but every caller in this package passes it: the whole point is to
+ * refuse a file that is not the session it was asked for.
+ */
+export function parseSessionCsv(csv: string, expectedDate?: string): Quote[] {
+  const rows = parseRows(csv, {
+    expectedDate,
+    emptyMessage:
+      "The body held no session rows. An empty session is not something the archive " +
+      "publishes — a day the market did not trade has no file at all.",
+  });
+
+  // The session is the caller's own frame, so it is not repeated on every row.
+  return rows.map((row) => row.quote);
+}
+
+/**
+ * One scrip's series file: `data/series/<TICKER>.csv`, when the archive publishes one.
+ *
+ * The rows are the whole history, so a caller filters them to the range it wants. They are
+ * sorted by date here rather than trusted to arrive in order, because a chart's points must
+ * be in date order whatever the file looks like — and because `history()` has to return the
+ * same thing from this path as from the session walk, which is ascending by construction.
+ */
+export function parseSeriesCsv(csv: string, expectedSymbol: string): DatedQuote[] {
+  const wanted = expectedSymbol.trim().toUpperCase();
+
+  const rows = parseRows(csv, {
+    expectedSymbol: wanted,
+    emptyMessage:
+      "The body held no series rows. An empty series is not something the archive " +
+      "publishes — a ticker with no history has no file at all.",
+  });
+
+  return rows
+    .map((row) => ({ ...row.quote, date: row.date }))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }

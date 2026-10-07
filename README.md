@@ -65,7 +65,7 @@ it.**
 
 | option | default | |
 | --- | --- | --- |
-| `cache` | in-memory | `memoryCache()`, `localStorageCache()`, `fileCache(dir)`, `noCache()` |
+| `cache` | in-memory | `memoryCache()`, `localStorageCache({ maxBytes })`, `fileCache(dir)`, `noCache()` |
 | `concurrency` | `6` | requests in flight at once |
 | `manifestTtlMs` | `300_000` | how long the index may be reused |
 | `hosts` | jsDelivr, then raw GitHub | in order |
@@ -85,9 +85,13 @@ One session, whole market: `{ date, rows }`. `latest()` is the newest.
 Every session in a calendar range, ascending. Days the market was shut are skipped.
 
 > **This is the expensive call**, though less so than it was. The archive publishes a date
-> list, so a year costs **one request to learn which days traded, plus one per session**,
-> about 230 for 2025, rather than the 366 a calendar walk would spend. Sessions are cached
-> permanently once read, so the second call over the same range costs nothing at all.
+> list, so a year costs **one request to learn which days traded, plus one per session** —
+> measured at **231 requests and 4.13 MB** for a year, returning 230 sessions. Sessions are
+> cached permanently once read, so the second call over the same range costs nothing at all.
+>
+> It is the right call only when you want the **whole market** across a range. For one
+> scrip use `history()`, for a handful use `series()`, and for the newest prices alone use
+> `snapshot()`.
 >
 > Where the archive publishes no date list, the client falls back to walking calendar days
 > and probing each one. Slower, and kept because it is the path that cannot be wrong.
@@ -101,10 +105,48 @@ A change is only reported when **both** sides are known. If the scrip did not tr
 previous session, or the previous close was zero, these are `null` rather than a figure
 computed against nothing.
 
+### `snapshot()`
+
+Every scrip in the newest session, each with its day change: `{ date, previousDate, rows }`.
+
+**This is what a market table, a portfolio or a watchlist should call.** `quote()` costs
+three requests for one scrip, so a page holding twenty of them would spend sixty;
+`snapshot()` spends the same three and answers for all of them, because the two session
+files it reads already hold the whole market. Measured against the archive as it stands:
+**3 requests, 37 KB, 359 scrips, 341 of them with a computable change.**
+
+The change rules are `quote()`'s, from the same code: `null` unless both sides are known,
+`0` when the price genuinely did not move.
+
 ### `history(symbol, { from, to })`
 
 One scrip's series over a range. Sessions where it did not trade contribute no point,
 never a `null` gap.
+
+When the archive publishes `data/series/<TICKER>.csv` — one scrip's whole history in the
+same eight columns as a session file, ascending by date — this becomes **one request**
+instead of one per trading day: measured over a year, 231 requests and 4.13 MB become one
+request for the file. The file is read once and kept for `manifestTtlMs`, so every later
+range for the same scrip is answered from memory rather than the network.
+
+An archive that publishes no series files — or one whose file cannot be read — falls back
+to walking the sessions, which is the path that cannot be wrong. A series file served under
+the wrong ticker is refused rather than believed, the same way a session file describing
+another day is.
+
+### `series(symbols, { from, to })`
+
+Several scrips' series in a single pass, as a `Map` from ticker to that ticker's points.
+
+The sessions are parsed **once** for the whole set. `history()` per symbol fetches the same
+files — they are cached — but parses them again for every symbol, which is the cost that
+turns up when a caller moves from one chart to a portfolio. Measured over a year: five
+symbols cost **137 ms** here against **636 ms** as five `history()` calls, and the gap
+grows with the set.
+
+Every ticker asked for is a key in the result, with an empty array when the archive never
+listed it. A delisted holding should not blank the rest of a portfolio, and an absent key
+would be indistinguishable from a bug.
 
 ### `symbols()`
 
@@ -142,6 +184,20 @@ asked about.
 **Nulls are real.** A halted scrip has no high price, and the archive writes an empty
 field. This package returns `null`, never `0`, because a zero high price is a claim that
 it traded at nothing.
+
+**The index, the date list and the directory are re-fetched conditionally, on purpose.**
+Those three are the only files the archive rewrites. jsDelivr serves a branch with
+`cache-control: max-age=604800`, so a browser would otherwise reuse a week-old `latest.json`
+without asking — a week-old close on screen, and a chart missing its newest sessions, with
+nothing to indicate it. Session files are immutable and are still cached hard. The
+revalidation is a conditional request both hosts answer with `304` and no body, so it costs
+a round trip and no bytes.
+
+**`localStorageCache` has a budget, and a year does not fit in it.** A session is about
+18 KB and a year is about 230 of them, so a yearly range is roughly 8 MB of UTF-16 against a
+per-origin quota of about 5 MB. It therefore evicts oldest-first to a `maxBytes` budget
+(4 MiB by default) instead of failing silently partway through. What actually carries a
+reload is the browser's own HTTP cache, which holds these files for a week regardless.
 
 **Dates are the session's, never the clock.** The market is shut for holidays and its
 trading week has changed, Sunday–Thursday until April 2026, Monday–Friday since. Nothing
