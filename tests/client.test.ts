@@ -728,6 +728,67 @@ describe("history and the archive's series file", () => {
     expect(requested.filter((url) => url.includes("data/series/"))).toHaveLength(0);
   });
 
+  it("reads a debenture whose ticker contains a slash", async () => {
+    // `GBILD86/87` is one ticker, but as a path it would be a directory. The archive writes
+    // it as `GBILD86-87.csv`, and the rows inside still name the ticker properly.
+    const withBond: Record<string, string> = {
+      ...ARCHIVE,
+      "data/series/GBILD86-87.csv": seriesBody("GBILD86/87", {
+        "2026-09-30": 1090,
+        "2026-10-01": 1091,
+      }),
+    };
+
+    const { fetchImpl, requested } = fakeArchive(withBond);
+    const points = await createClient({ fetch: fetchImpl }).history("gbild86/87", RANGE);
+
+    expect(points.map((point) => point.symbol)).toEqual(["GBILD86/87", "GBILD86/87"]);
+    expect(requested.filter((url) => url.includes("data/series/GBILD86-87.csv"))).toHaveLength(1);
+    // And never a path that treats the ticker as a directory.
+    expect(requested.some((url) => /data\/series\/GBILD86\//.test(url))).toBe(false);
+  });
+
+  it("names a series file exactly as the archive does", async () => {
+    // A contract with nepse-data's src/lib/series.ts, asserted through the public API
+    // rather than by exporting the rule: a disagreement here sends every read to a file
+    // that is not there, and falling back to the session walk looks like an archive that
+    // simply publishes no series files.
+    const cases: [symbol: string, file: string][] = [
+      ["NABIL", "NABIL.csv"],
+      ["ADBLB86", "ADBLB86.csv"],
+      ["GBILD86/87", "GBILD86-87.csv"],
+      ["NIFRAUR85/", "NIFRAUR85.csv"],
+      ["N/A", "N-A.csv"],
+    ];
+
+    for (const [symbol, file] of cases) {
+      const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+      await createClient({ fetch: fetchImpl }).history(symbol, RANGE);
+
+      const asked = requested.filter((url) => url.includes("data/series/"));
+      expect(asked, symbol).toHaveLength(1);
+      expect(asked[0]?.endsWith(`data/series/${file}`), symbol).toBe(true);
+    }
+  });
+
+  it("takes the session walk for anything that is not a ticker", async () => {
+    for (const notATicker of ["NABIL BANK", "../NABIL", "///"]) {
+      const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+      await createClient({ fetch: fetchImpl }).history(notATicker, RANGE);
+
+      expect(requested.filter((url) => url.includes("data/series/")), notATicker).toHaveLength(0);
+    }
+  });
+
+  it("refuses an empty symbol instead of searching for one", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
+
+    await expect(createClient({ fetch: fetchImpl }).history("   ", RANGE)).rejects.toThrow(
+      /A symbol is required/,
+    );
+    expect(requested).toHaveLength(0);
+  });
+
   it("still refuses a range that ends before it starts, on the series path", async () => {
     const { fetchImpl, requested } = fakeArchive(WITH_SERIES);
 
