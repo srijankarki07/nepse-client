@@ -207,6 +207,46 @@ describe("the real archive", () => {
     },
   );
 
+  it("serves the exchange's own index levels", async () => {
+    const levels = await client.indices();
+
+    // The archive began publishing these on 2026-10-07, so an empty list means the artifact
+    // is not reaching this client rather than that the market has no indices.
+    expect(levels.length).toBeGreaterThan(5);
+
+    const nepse = levels.find((level) => level.key === "nepse");
+    expect(nepse?.name).toMatch(/nepse/i);
+    expect(nepse?.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(nepse?.close).toBeGreaterThan(0);
+
+    // Every level is keyed by something that could name a file, which is what makes the key
+    // a usable argument to `indexHistory`.
+    for (const level of levels) expect(level.key).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+  });
+
+  it("agrees with itself about an index: levels and history are the same figure", async () => {
+    // Two independent paths to one fact, which is the shape of assertion this file is for.
+    // `indices()` reads data/indices/latest.json and `indexHistory()` reads the per-index
+    // CSV, so a disagreement means one of the two artifacts is stale or was written wrong.
+    const levels = await client.indices();
+    const nepse = levels.find((level) => level.key === "nepse");
+    expect(nepse).toBeDefined();
+    if (nepse === undefined) return;
+
+    const rows = await client.indexHistory("nepse", { from: nepse.date, to: nepse.date });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.close).toBe(nepse.close);
+    expect(rows[0]?.change).toBe(nepse.change);
+    expect(rows[0]?.turnover).toBe(nepse.turnover);
+  });
+
+  it("reports a key the archive does not publish as absent", async () => {
+    await expect(
+      client.indexHistory("not-an-index", { from: "2026-10-01", to: "2026-10-31" }),
+    ).resolves.toEqual([]);
+  });
+
   it("reports a date the archive does not hold as absent", async () => {
     // April 2020 is the safest genuinely empty period the archive has: NEPSE halted
     // trading for the COVID lockdown and the whole month has no sessions at all.

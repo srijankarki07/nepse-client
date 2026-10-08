@@ -12,12 +12,15 @@ import { describe, expect, it } from "vitest";
 import {
   ArchiveFormatError,
   COLUMNS,
+  INDEX_COLUMNS,
   parseClosesCsv,
+  parseIndexCsv,
   parseSeriesCsv,
   parseSessionCsv,
 } from "../src/index.js";
 
 const HEADER = COLUMNS.join(",");
+const INDEX_HEADER = INDEX_COLUMNS.join(",");
 
 /** One row, in the archive's column order. */
 function row(
@@ -208,6 +211,90 @@ describe("parseClosesCsv", () => {
 
   it("refuses a body with no rows at all", () => {
     expect(() => parseClosesCsv("", "2026")).toThrow(/no closes rows/);
+  });
+});
+
+describe("parseIndexCsv", () => {
+  const indexFile = (...rows: string[]) => [INDEX_HEADER, ...rows].join("\r\n") + "\r\n";
+
+  const ROW = "2026-10-07,2579,2579.1,2565.22,2572.34,-6.38,-0.24,3748080303.07";
+
+  it("reads a level with its move and its turnover", () => {
+    expect(parseIndexCsv(indexFile(ROW))).toEqual([
+      {
+        date: "2026-10-07",
+        open: 2579,
+        high: 2579.1,
+        low: 2565.22,
+        close: 2572.34,
+        change: -6.38,
+        percentChange: -0.24,
+        turnover: 3748080303.07,
+      },
+    ]);
+  });
+
+  it("sorts ascending whatever order the file holds", () => {
+    // A chart's points must ascend, and the live path has to agree with a caller's own sort.
+    const rows = parseIndexCsv(
+      indexFile(
+        "2026-10-07,1,2,0.5,1.5,0.1,0.2,1000",
+        "2026-10-05,1,2,0.5,1.5,0.1,0.2,1000",
+        "2026-10-06,1,2,0.5,1.5,0.1,0.2,1000",
+      ),
+    );
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-10-05", "2026-10-06", "2026-10-07"]);
+  });
+
+  it("leaves an unpublished figure empty rather than zero", () => {
+    // A zero is a claim the index closed at nothing. The archive writes an empty field, and
+    // that has to survive as an absence.
+    const rows = parseIndexCsv(indexFile("2026-10-07,,,,2572.34,-6.38,,"));
+
+    expect(rows[0]).toEqual({
+      date: "2026-10-07",
+      open: null,
+      high: null,
+      low: null,
+      close: 2572.34,
+      change: -6.38,
+      percentChange: null,
+      turnover: null,
+    });
+  });
+
+  it("refuses a session file served at the index path", () => {
+    // Every column here is a number, so a session file would parse into seven plausible
+    // numbers per row rather than failing. The header is the only thing that catches it.
+    expect(() => parseIndexCsv(`${HEADER}\r\n${row("2026-10-07", "NABIL")}\r\n`)).toThrow(
+      /An index header reads/,
+    );
+  });
+
+  it("refuses a closes file served at the index path", () => {
+    expect(() => parseIndexCsv('date,NABIL,ADBL\r\n2026-10-07,566,307.5\r\n')).toThrow(
+      /An index header reads/,
+    );
+  });
+
+  it("refuses a row that does not match the header's width", () => {
+    expect(() => parseIndexCsv(indexFile("2026-10-07,2579,2579.1,2565.22"))).toThrow(
+      /has 4 columns, expected 8/,
+    );
+  });
+
+  it("refuses a row whose date is not a date", () => {
+    expect(() => parseIndexCsv(indexFile("07/10/2026,1,2,0.5,1.5,0.1,0.2,1000"))).toThrow(
+      /unusable date/,
+    );
+  });
+
+  it("refuses a file with no rows at all", () => {
+    // A header with nothing under it is not "an index with no history", which has no file at
+    // all. It is the signature of a write that did not finish.
+    expect(() => parseIndexCsv("")).toThrow(ArchiveFormatError);
+    expect(() => parseIndexCsv(`${INDEX_HEADER}\r\n`)).toThrow(/held no index rows/);
   });
 });
 

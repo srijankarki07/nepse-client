@@ -37,7 +37,22 @@
  * against the ticker.
  */
 
-import type { DatedCloses, DatedQuote, Quote } from "./types.js";
+import type { DatedCloses, DatedIndexLevel, DatedQuote, Quote } from "./types.js";
+
+/**
+ * The index format's column order. Exported so a consumer can assert against it, and so a
+ * reader can see at a glance that it is not the archive's session order.
+ */
+export const INDEX_COLUMNS = [
+  "date",
+  "open",
+  "high",
+  "low",
+  "close",
+  "change",
+  "percentChange",
+  "turnover",
+] as const;
 
 /** The archive's column order. Exported so a consumer can assert against it. */
 export const COLUMNS = [
@@ -318,6 +333,96 @@ export function parseClosesCsv(csv: string, expectedYear: string): DatedCloses[]
  * be in date order whatever the file looks like — and because `history()` has to return the
  * same thing from this path as from the session walk, which is ascending by construction.
  */
+/**
+ * One index's history: `data/indices/<key>.csv`, when the archive publishes one.
+ *
+ * The shortest format here, and the only one whose columns are all numbers. Eight of them,
+ * fixed, in the order the header names:
+ *
+ * ```csv
+ * date,open,high,low,close,change,percentChange,turnover
+ * 2026-10-07,2579,2579.1,2565.22,2572.34,-6.38,-0.24,3748080303.07
+ * ```
+ *
+ * The header is checked **exactly** rather than by width, which is a departure from the
+ * closes reader next door. That reader can afford to be loose because its rows carry tickers,
+ * so a wrong file turns into tickers named `open` and `close`. Here every column is a number,
+ * so a session or closes file served at this path would parse into plausible nonsense: seven
+ * numbers per row that look like a level, a change and a turnover and are not. Comparing the
+ * header against a constant is the only thing that catches it.
+ *
+ * ## What this cannot check, and why
+ *
+ * Nothing in these rows names the index, so unlike a session file (checked against its date)
+ * or a series file (checked against its ticker) there is no in-file evidence that this is the
+ * index that was asked for. The key is a property of the file's *name*, not of its contents.
+ * `data/latest.json` and `data/symbols.json` have the same property and are read the same way.
+ * What the checks below do catch is a file in a different format, a damaged row, and a row
+ * dated to something that is not a date.
+ */
+export function parseIndexCsv(csv: string): DatedIndexLevel[] {
+  const lines = csv.split(/\r?\n/).filter((line) => line !== "");
+  const header = lines[0];
+
+  if (header === undefined) {
+    throw new ArchiveFormatError(
+      "The body held no index rows. An empty index is not something the archive publishes " +
+        "— an index with no history has no file at all.",
+    );
+  }
+
+  if (header.trim() !== INDEX_COLUMNS.join(",")) {
+    throw new ArchiveFormatError(
+      `An index header reads "${header.slice(0, 60)}" where ` +
+        `"${INDEX_COLUMNS.join(",")}" was expected. The archive's format has changed, or ` +
+        "this is not an index file.",
+    );
+  }
+
+  const rows: DatedIndexLevel[] = [];
+
+  for (let index = 1; index < lines.length; index++) {
+    const fields = (lines[index] ?? "").split(",");
+
+    if (fields.length !== INDEX_COLUMNS.length) {
+      throw new ArchiveFormatError(
+        `An index row has ${fields.length} columns, expected ${INDEX_COLUMNS.length} to match ` +
+          "the header. The archive's format has changed, or the file is damaged.",
+      );
+    }
+
+    const date = (fields[0] ?? "").trim();
+    if (!DATE_PATTERN.test(date)) {
+      throw new ArchiveFormatError(`An index row carries an unusable date: "${date}".`);
+    }
+
+    rows.push({
+      date,
+      open: parseNumber(fields[1] ?? ""),
+      high: parseNumber(fields[2] ?? ""),
+      low: parseNumber(fields[3] ?? ""),
+      close: parseNumber(fields[4] ?? ""),
+      change: parseNumber(fields[5] ?? ""),
+      percentChange: parseNumber(fields[6] ?? ""),
+      turnover: parseNumber(fields[7] ?? ""),
+    });
+  }
+
+  if (rows.length === 0) {
+    // The same rule the other two readers apply: an empty file is not something the archive
+    // publishes. An index with no history has no file at all, so a header with nothing under
+    // it means something went wrong rather than that the index is new.
+    throw new ArchiveFormatError(
+      "The body held no index rows. An empty index is not something the archive publishes " +
+        "— an index with no history has no file at all.",
+    );
+  }
+
+  // Sorted here rather than trusted to arrive in order, so a chart's points ascend whatever
+  // the file looks like. The archive writes them ascending already; this is a guarantee.
+  return rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
 export function parseSeriesCsv(csv: string, expectedSymbol: string): DatedQuote[] {
   const wanted = expectedSymbol.trim().toUpperCase();
 
