@@ -30,6 +30,24 @@ export interface DatedQuote extends Quote {
   date: string;
 }
 
+/**
+ * One session's closing prices, keyed by ticker. What `closes` returns, one per date.
+ *
+ * A `Map` rather than an array of quotes, because this is the shape the arithmetic wants:
+ * the equal-weighted index is the mean of each scrip's day-on-day ratio, so what a caller
+ * needs for a date is a lookup from ticker to close, and nothing else.
+ *
+ * Scrips that did not trade that day, and scrips that traded without publishing a close, are
+ * both **absent** rather than present with a `null`. Neither has a ratio against the previous
+ * day, so neither may be counted as one, and an absent key cannot be accidentally summed.
+ */
+export interface DatedCloses {
+  /** The trading session, `YYYY-MM-DD`. */
+  date: string;
+  /** Ticker to closing price, in NPR. */
+  closes: Map<string, number>;
+}
+
 /** Every scrip the archive lists for one session. */
 export interface Session {
   /** The trading session, `YYYY-MM-DD`, taken from the file's own rows. */

@@ -9,7 +9,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { ArchiveFormatError, COLUMNS, parseSeriesCsv, parseSessionCsv } from "../src/index.js";
+import {
+  ArchiveFormatError,
+  COLUMNS,
+  parseClosesCsv,
+  parseSeriesCsv,
+  parseSessionCsv,
+} from "../src/index.js";
 
 const HEADER = COLUMNS.join(",");
 
@@ -131,6 +137,77 @@ describe("parseSessionCsv", () => {
   it("upper-cases the ticker", () => {
     const rows = parseSessionCsv(body(row("2026-10-01", "nabil")), "2026-10-01");
     expect(rows[0]?.symbol).toBe("NABIL");
+  });
+});
+
+describe("parseClosesCsv", () => {
+  const closesFile = (...lines: string[]) => lines.join("\r\n") + "\r\n";
+
+  it("reads a date into a ticker-to-close lookup", () => {
+    const rows = parseClosesCsv(closesFile("date,ADBL,NABIL", "2026-09-30,307.5,570"), "2026");
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.date).toBe("2026-09-30");
+    expect([...(rows[0]?.closes ?? [])]).toEqual([
+      ["ADBL", 307.5],
+      ["NABIL", 570],
+    ]);
+  });
+
+  it("leaves an empty cell out instead of reading it as zero", () => {
+    // The scrip did not trade, or published no close. Either way it has no ratio against the
+    // previous day, and a zero would invent one.
+    const rows = parseClosesCsv(closesFile("date,ADBL,NABIL", "2026-09-30,,570"), "2026");
+
+    expect(rows[0]?.closes.has("ADBL")).toBe(false);
+    expect(rows[0]?.closes.get("NABIL")).toBe(570);
+  });
+
+  it("puts the dates in order whatever order the file is in", () => {
+    const rows = parseClosesCsv(
+      closesFile("date,NABIL", "2026-10-01,566", "2026-09-30,570"),
+      "2026",
+    );
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-30", "2026-10-01"]);
+  });
+
+  it("refuses a file describing another year", () => {
+    // The same guard the session reader applies to its date and the series reader to its
+    // ticker: a file served under the wrong name would be filed under the wrong year.
+    expect(() => parseClosesCsv(closesFile("date,NABIL", "2025-12-31,500"), "2026")).toThrow(
+      /describes 2025-12-31/,
+    );
+  });
+
+  it("refuses a row that disagrees with the header about the column count", () => {
+    expect(() =>
+      parseClosesCsv(closesFile("date,ADBL,NABIL", "2026-09-30,307.5"), "2026"),
+    ).toThrow(/has 2 columns, expected 3/);
+  });
+
+  it("refuses a session file served where a closes file was expected", () => {
+    // It would otherwise parse happily: its header also starts with `date`, and every row
+    // would read as a date plus tickers named "symbol", "open" and so on.
+    const session = closesFile(HEADER, row("2026-09-30", "NABIL"));
+
+    expect(() => parseClosesCsv(session, "2026")).toThrow(/This is a session file/);
+  });
+
+  it("refuses a header that is not a closes header", () => {
+    expect(() => parseClosesCsv(closesFile("symbol,NABIL", "2026-09-30,570"), "2026")).toThrow(
+      /must start with "date"/,
+    );
+  });
+
+  it("refuses an unusable date", () => {
+    expect(() => parseClosesCsv(closesFile("date,NABIL", "30-09-2026,570"), "2026")).toThrow(
+      /unusable date/,
+    );
+  });
+
+  it("refuses a body with no rows at all", () => {
+    expect(() => parseClosesCsv("", "2026")).toThrow(/no closes rows/);
   });
 });
 

@@ -27,7 +27,12 @@
  */
 
 import { type Cache, memoryCache } from "./cache.js";
-import { ArchiveFormatError, parseSeriesCsv, parseSessionCsv } from "./csv.js";
+import {
+  ArchiveFormatError,
+  parseClosesCsv,
+  parseSeriesCsv,
+  parseSessionCsv,
+} from "./csv.js";
 import {
   SessionNotFoundError,
   SymbolNotFoundError,
@@ -38,6 +43,7 @@ import {
 } from "./transport.js";
 import type {
   ArchiveManifest,
+  DatedCloses,
   DatedQuote,
   ManifestResult,
   Quote,
@@ -60,6 +66,9 @@ const SYMBOLS_KEY = "symbols-directory";
  * error, and the session walk below stays the path that cannot be wrong.
  */
 const SERIES_DIRECTORY = "data/series";
+
+/** Where a year's whole-market closes live, when the archive publishes one. */
+const CLOSES_DIRECTORY = "data/closes";
 
 /** A ticker worth naming a file after: letters, digits, and the slash a bond code uses. */
 const SERIES_TICKER = /^[A-Z0-9/]+$/;
@@ -157,6 +166,27 @@ export interface NepseDataClient {
    * sessions — the path that cannot be wrong.
    */
   history(symbol: string, range: RangeOptions): Promise<DatedQuote[]>;
+  /**
+   * Every scrip's closing price for every session in a range, ascending by date.
+   *
+   * **This is what a market-wide chart should read.** `sessions()` returns full rows and
+   * costs one request per trading day, which is 231 requests and 4.13 MB for a year; this
+   * costs **one request per calendar year the range covers**, about 450 KB each, because the
+   * archive publishes a year of closes as a single wide file. An equal-weighted index, a
+   * heatmap, or a portfolio's daily values can all be computed from what it returns.
+   *
+   * It carries closes only, by design. For one scrip with its open, high, low, volume and
+   * turnover, use `history()`; for a handful of scrips, `series()`. **For more than two or
+   * three, this is cheaper than `series()`**: a year of the whole market is one 450 KB
+   * request, where three scrips would be three files of about 180 KB each.
+   *
+   * Scrips that did not trade, or that published no close, are **absent** from a date's map
+   * rather than present with a `null`, so a caller cannot compute a ratio against nothing.
+   *
+   * When the archive publishes no closes file for a year in the range, it falls back to
+   * walking the sessions for the whole range, which is the path that cannot be wrong.
+   */
+  closes(range: RangeOptions): Promise<DatedCloses[]>;
   /**
    * Several scrips' series across one range, in a single pass — what `history()` is for one
    * scrip.
@@ -294,6 +324,21 @@ function changeAgainst(
       : null;
 
   return { change, changePercent };
+}
+
+/**
+ * The closing prices in a session, keyed by ticker.
+ *
+ * A scrip with no published close is left out rather than mapped to `null`, which is the same
+ * thing the closes files do by leaving the cell empty: a caller is computing ratios, and a
+ * scrip with no close has no ratio against the previous day.
+ */
+function closedIn(session: Session): Map<string, number> {
+  const closes = new Map<string, number>();
+  for (const row of session.rows) {
+    if (row.close !== null) closes.set(row.symbol, row.close);
+  }
+  return closes;
 }
 
 export function createClient(options: ClientOptions = {}): NepseDataClient {
@@ -667,6 +712,74 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     }
   }
 
+  /**
+   * A year's closes once read, kept for the mutable TTL, like the series files.
+   *
+   * A `null` value means "asked, and the archive publishes none for that year", which is
+   * remembered only for the TTL: an archive is expected to start publishing these, and an
+   * absence that outlived the fact would pin a client to the slow path forever.
+   */
+  const closesMemo = new Map<string, { rows: DatedCloses[] | null; until: number }>();
+
+  /** The years a range touches, ascending. `2025-10-01` to `2026-02-01` is two. */
+  function yearsIn(from: string, to: string): string[] {
+    const first = Number(from.slice(0, 4));
+    const last = Number(to.slice(0, 4));
+
+    const years: string[] = [];
+    for (let year = first; year <= last; year++) years.push(String(year));
+    return years;
+  }
+
+  /** One year's closes file, or `null` when the archive publishes none. */
+  async function readCloses(year: string): Promise<DatedCloses[] | null> {
+    const memo = closesMemo.get(year);
+    if (memo !== undefined && Date.now() < memo.until) return memo.rows;
+
+    try {
+      const body = await transport.get(`${CLOSES_DIRECTORY}/${year}.csv`);
+      const rows = parseClosesCsv(body, year);
+      closesMemo.set(year, { rows, until: Date.now() + manifestTtlMs });
+      return rows;
+    } catch (error) {
+      // Only "the archive publishes no closes for this year" is worth remembering. A
+      // network failure is not a fact about the archive, and the next call tries again.
+      if (error instanceof Error && error.name === "SessionNotFoundError") {
+        closesMemo.set(year, { rows: null, until: Date.now() + manifestTtlMs });
+      }
+      return null;
+    }
+  }
+
+  async function closes(range: RangeOptions): Promise<DatedCloses[]> {
+    assertRange(range);
+    if (range.signal?.aborted === true) return [];
+
+    const years = yearsIn(range.from, range.to);
+    const perYear: DatedCloses[] = [];
+
+    for (const [index, year] of years.entries()) {
+      const rows = await readCloses(year);
+
+      if (rows === null) {
+        // A year the archive does not publish breaks the whole answer, not just that year:
+        // it is a range, and a caller given a gap would compute a change across it as though
+        // the market had been shut. The session walk covers every year correctly.
+        return (await sessions(range)).map((session) => ({
+          date: session.date,
+          closes: closedIn(session),
+        }));
+      }
+
+      perYear.push(...rows);
+      range.onProgress?.({ done: index + 1, total: years.length, date: year });
+    }
+
+    return perYear
+      .filter((row) => row.date >= range.from && row.date <= range.to)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+
   async function history(symbol: string, range: RangeOptions): Promise<DatedQuote[]> {
     const wanted = symbol.trim().toUpperCase();
     if (wanted === "") throw new ArchiveFormatError("A symbol is required.");
@@ -758,6 +871,7 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     quote,
     snapshot,
     history,
+    closes,
     series,
     symbols,
     directory,

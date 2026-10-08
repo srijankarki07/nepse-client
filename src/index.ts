@@ -59,10 +59,17 @@ export {
   type TransportOptions,
 } from "./transport.js";
 
-export { ArchiveFormatError, COLUMNS, parseSeriesCsv, parseSessionCsv } from "./csv.js";
+export {
+  ArchiveFormatError,
+  COLUMNS,
+  parseClosesCsv,
+  parseSeriesCsv,
+  parseSessionCsv,
+} from "./csv.js";
 
 export type {
   ArchiveManifest,
+  DatedCloses,
   DatedQuote,
   ManifestResult,
   Quote,
