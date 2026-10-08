@@ -934,6 +934,224 @@ describe("closes and the archive's per-year file", () => {
   });
 });
 
+describe("indices and the archive's index files", () => {
+  const RANGE = { from: "2026-09-01", to: "2026-10-01" };
+
+  /** `data/indices/latest.json`, as the archive publishes it. */
+  function levelsBody(entries: Record<string, unknown>, date = "2026-10-01"): string {
+    return JSON.stringify({ date, indices: entries });
+  }
+
+  const NEPSE = {
+    name: "NEPSE Index",
+    date: "2026-10-01",
+    open: 2579,
+    high: 2579.1,
+    low: 2565.22,
+    close: 2572.34,
+    change: -6.38,
+    percentChange: -0.24,
+    turnover: 3748080303.07,
+  };
+
+  const BANKING = {
+    name: "Banking SubIndex",
+    date: "2026-10-01",
+    open: 1500.15,
+    high: 1500.15,
+    low: 1488.44,
+    close: 1495.17,
+    change: 1.73,
+    percentChange: 0.11,
+    turnover: 515449881.5,
+  };
+
+  /** Two indices' history, in the archive's own column order. */
+  const indexBody = (...lines: string[]) =>
+    ["date,open,high,low,close,change,percentChange,turnover", ...lines].join("\r\n") + "\r\n";
+
+  const WITH_INDICES: Record<string, string> = {
+    ...ARCHIVE,
+    "data/indices/latest.json": levelsBody({ nepse: NEPSE, banking: BANKING }),
+    "data/indices/nepse.csv": indexBody(
+      "2026-09-30,2570,2580,2560,2578.72,4.1,0.16,3000000000",
+      "2026-10-01,2579,2579.1,2565.22,2572.34,-6.38,-0.24,3748080303.07",
+    ),
+  };
+
+  it("reads the levels, each with the key its history is filed under", async () => {
+    const { fetchImpl } = fakeArchive(WITH_INDICES);
+    const levels = await createClient({ fetch: fetchImpl }).indices();
+
+    // Sorted by key, so the order is this client's rather than the file's.
+    expect(levels.map((level) => level.key)).toEqual(["banking", "nepse"]);
+    expect(levels[1]).toMatchObject({
+      key: "nepse",
+      name: "NEPSE Index",
+      date: "2026-10-01",
+      close: 2572.34,
+      change: -6.38,
+      percentChange: -0.24,
+      turnover: 3748080303.07,
+    });
+  });
+
+  it("answers an empty list for an archive that publishes none", async () => {
+    // The ordinary case for an archive predating the artifact, and the reason a site's rail
+    // can hide itself rather than fail. Not an error, so not a throw.
+    const { fetchImpl } = fakeArchive(ARCHIVE);
+
+    await expect(createClient({ fetch: fetchImpl }).indices()).resolves.toEqual([]);
+  });
+
+  it("refuses a levels file that is there and unreadable", async () => {
+    // The other half of that distinction: something *is* published and wrong, and reporting
+    // it as "no indices" would be a lie a caller has no way to detect.
+    const { fetchImpl } = fakeArchive({ ...ARCHIVE, "data/indices/latest.json": "{ not json" });
+
+    await expect(createClient({ fetch: fetchImpl }).indices()).rejects.toThrow(/not valid JSON/);
+  });
+
+  it("refuses a level whose close is not a number", async () => {
+    const { fetchImpl } = fakeArchive({
+      ...ARCHIVE,
+      "data/indices/latest.json": levelsBody({ nepse: { ...NEPSE, close: "2572.34" } }),
+    });
+
+    await expect(createClient({ fetch: fetchImpl }).indices()).rejects.toThrow(
+      /non-numeric close/,
+    );
+  });
+
+  it("keeps a level that was not published as null rather than zero", async () => {
+    const { fetchImpl } = fakeArchive({
+      ...ARCHIVE,
+      "data/indices/latest.json": levelsBody({ nepse: { ...NEPSE, high: null, change: null } }),
+    });
+
+    const levels = await createClient({ fetch: fetchImpl }).indices();
+
+    expect(levels[0]?.high).toBeNull();
+    expect(levels[0]?.change).toBeNull();
+  });
+
+  it("reads the levels once for repeated calls", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_INDICES);
+    const client = createClient({ fetch: fetchImpl });
+
+    await client.indices();
+    await client.indices();
+
+    expect(requested.filter((url) => url.includes("data/indices/latest.json"))).toHaveLength(1);
+  });
+
+  it("reads one index's history in one request", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_INDICES);
+    const rows = await createClient({ fetch: fetchImpl }).indexHistory("nepse", RANGE);
+
+    expect(requested.filter((url) => url.includes("data/indices/"))).toHaveLength(1);
+    expect(rows.map((row) => row.date)).toEqual(["2026-09-30", "2026-10-01"]);
+    expect(rows[1]?.close).toBe(2572.34);
+    expect(rows[1]?.percentChange).toBe(-0.24);
+  });
+
+  it("filters the history to the range asked for", async () => {
+    const { fetchImpl } = fakeArchive(WITH_INDICES);
+    const client = createClient({ fetch: fetchImpl });
+
+    const rows = await client.indexHistory("nepse", { from: "2026-10-01", to: "2026-10-01" });
+
+    expect(rows.map((row) => row.date)).toEqual(["2026-10-01"]);
+  });
+
+  it("answers an empty list for a key the archive does not publish", async () => {
+    const { fetchImpl } = fakeArchive(WITH_INDICES);
+
+    await expect(
+      createClient({ fetch: fetchImpl }).indexHistory("trading", RANGE),
+    ).resolves.toEqual([]);
+  });
+
+  it("refuses a key that could not name a file", async () => {
+    // A caller's mistake rather than a missing index, so it throws rather than answering an
+    // empty list a caller could not tell from "the archive has none".
+    const { fetchImpl, requested } = fakeArchive(WITH_INDICES);
+    const client = createClient({ fetch: fetchImpl });
+
+    await expect(client.indexHistory("../../latest", RANGE)).rejects.toThrow(/not an index key/);
+    await expect(client.indexHistory("nepse/../nepse", RANGE)).rejects.toThrow(/not an index key/);
+    await expect(client.indexHistory(" ", RANGE)).rejects.toThrow(/not an index key/);
+    expect(requested).toHaveLength(0);
+  });
+
+  it("takes a key however it is capitalised", async () => {
+    // The archive's keys are lowercase, so a caller reaching for `NEPSE` means `nepse`. That
+    // is a spelling difference, not a different index, and the same latitude `symbols()` gives.
+    const { fetchImpl } = fakeArchive(WITH_INDICES);
+
+    const rows = await createClient({ fetch: fetchImpl }).indexHistory("NEPSE", RANGE);
+
+    expect(rows).toHaveLength(2);
+  });
+
+  it("names an index file exactly as the archive does", async () => {
+    // A contract with nepse-data's `indexPath`, asserted through the public API rather than
+    // by exporting the rule: a disagreement here sends every read to a file that is not
+    // there, which looks exactly like an index the archive does not publish. These are the
+    // archive's fixed keys, so a rename on either side is meant to fail this.
+    const keys = [
+      "nepse",
+      "sensitive",
+      "float",
+      "sensitive-float",
+      "banking",
+      "development-bank",
+      "finance",
+      "hotels-and-tourism",
+      "hydropower",
+      "investment",
+      "life-insurance",
+      "manufacturing-and-processing",
+      "microfinance",
+      "mutual-fund",
+      "non-life-insurance",
+      "others",
+      "trading",
+    ];
+
+    for (const key of keys) {
+      const { fetchImpl, requested } = fakeArchive(WITH_INDICES);
+      await createClient({ fetch: fetchImpl }).indexHistory(key, RANGE);
+
+      const asked = requested.filter((url) => url.includes("data/indices/"));
+      expect(asked, key).toHaveLength(1);
+      expect(asked[0]?.endsWith(`data/indices/${key}.csv`), key).toBe(true);
+    }
+  });
+
+  it("refuses an index file that is not in the index format", async () => {
+    const { fetchImpl } = fakeArchive({
+      ...WITH_INDICES,
+      "data/indices/nepse.csv": sessionBody("2026-10-01", { NABIL: 566 }),
+    });
+
+    await expect(createClient({ fetch: fetchImpl }).indexHistory("nepse", RANGE)).rejects.toThrow(
+      /An index header reads/,
+    );
+  });
+
+  it("stops when the caller's signal is aborted", async () => {
+    const { fetchImpl, requested } = fakeArchive(WITH_INDICES);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      createClient({ fetch: fetchImpl }).indexHistory("nepse", { ...RANGE, signal: controller.signal }),
+    ).resolves.toEqual([]);
+    expect(requested).toHaveLength(0);
+  });
+});
+
 describe("sessionDates", () => {
   it("lists the sessions in a range without fetching any of them", async () => {
     const { fetchImpl, requested } = fakeArchive(ARCHIVE);

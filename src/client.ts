@@ -30,6 +30,7 @@ import { type Cache, memoryCache } from "./cache.js";
 import {
   ArchiveFormatError,
   parseClosesCsv,
+  parseIndexCsv,
   parseSeriesCsv,
   parseSessionCsv,
 } from "./csv.js";
@@ -44,7 +45,9 @@ import {
 import type {
   ArchiveManifest,
   DatedCloses,
+  DatedIndexLevel,
   DatedQuote,
+  IndexLevel,
   ManifestResult,
   Quote,
   Session,
@@ -57,6 +60,7 @@ const SYMBOLS_PATH = "data/symbols.json";
 const MANIFEST_KEY = "manifest";
 const SESSIONS_KEY = "sessions-index";
 const SYMBOLS_KEY = "symbols-directory";
+const INDICES_KEY = "index-levels";
 
 /**
  * Where a scrip's whole history lives, when the archive publishes one.
@@ -70,8 +74,28 @@ const SERIES_DIRECTORY = "data/series";
 /** Where a year's whole-market closes live, when the archive publishes one. */
 const CLOSES_DIRECTORY = "data/closes";
 
+/**
+ * Where the exchange's own index levels live, when the archive publishes them.
+ *
+ * `latest.json` holds every level for the newest session and is the hot path; one file per
+ * index holds the history. Optional by design, like the other two: an archive that predates
+ * this publishes neither, so its absence is an empty answer rather than an error.
+ */
+const INDICES_DIRECTORY = "data/indices";
+const INDICES_PATH = `${INDICES_DIRECTORY}/latest.json`;
+
 /** A ticker worth naming a file after: letters, digits, and the slash a bond code uses. */
 const SERIES_TICKER = /^[A-Z0-9/]+$/;
+
+/**
+ * A key worth naming a file after.
+ *
+ * Mirrors the archive's own rule, which refuses anything else because the key becomes a path
+ * segment. Duplicated here rather than trusted, so a key that could escape the directory is
+ * refused before it reaches a URL — and the two copies are the one thing that could silently
+ * disagree, so a test asserts they agree.
+ */
+const INDEX_KEY = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 /** How long a manifest may be reused. It changes at most once a day. */
 const DEFAULT_MANIFEST_TTL_MS = 5 * 60 * 1000;
@@ -201,6 +225,30 @@ export interface NepseDataClient {
    * absent key would be indistinguishable from a bug.
    */
   series(symbols: readonly string[], range: RangeOptions): Promise<Map<string, DatedQuote[]>>;
+  /**
+   * The exchange's own index levels for the newest session, keyed by index.
+   *
+   * These are NEPSE's published levels, not an index computed from the prices. They cannot
+   * be computed from them: the archive holds no share counts, and a capitalisation-weighted
+   * index needs them. `closes()` is what to reach for to compute one anyway, and the two are
+   * different things that should be labelled differently.
+   *
+   * **An archive that publishes none yields an empty array**, which is the ordinary case for
+   * one that predates this artifact, so a caller renders nothing rather than failing. A file
+   * that is there and unreadable throws instead.
+   */
+  indices(): Promise<IndexLevel[]>;
+  /**
+   * One index's history across a range, ascending, by the key `indices()` gives for it.
+   *
+   * **It does not reach back as far as the prices do.** The archive accumulates these from
+   * the day it began recording them, because the source only ever shows the current session,
+   * so a range starting earlier simply has fewer points rather than an error.
+   *
+   * A key the archive does not publish yields an empty array. A key that could not name a
+   * file at all throws, because that is a caller's mistake rather than a missing index.
+   */
+  indexHistory(key: string, range: RangeOptions): Promise<DatedIndexLevel[]>;
   /** Tickers listed in the latest session. */
   symbols(): Promise<string[]>;
   /**
@@ -863,6 +911,182 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     return (await directory())[wanted]?.name ?? null;
   }
 
+  /** A JSON value that should be a number. `null` is a value; a string is a format change. */
+  function levelNumber(key: string, field: string, value: unknown): number | null {
+    if (value === null || value === undefined) return null;
+
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new ArchiveFormatError(
+        `The archive's index level for "${key}" has a non-numeric ${field}: ` +
+          `${JSON.stringify(value)}.`,
+      );
+    }
+
+    return value;
+  }
+
+  /**
+   * The published levels file, as `IndexLevel[]`.
+   *
+   * A body that is there and not the expected shape is refused rather than read as an empty
+   * list, so a caller cannot mistake a broken file for an archive that publishes none. That
+   * is the distinction `indices()` draws, and it is only useful if this half holds.
+   */
+  function parseLevels(body: string): IndexLevel[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      throw new ArchiveFormatError("The archive's index levels are not valid JSON.");
+    }
+
+    const indices = (parsed as { indices?: unknown } | null)?.indices;
+
+    if (indices === null || typeof indices !== "object" || Array.isArray(indices)) {
+      throw new ArchiveFormatError("The archive's index levels carry no indices object.");
+    }
+
+    const levels: IndexLevel[] = [];
+
+    for (const [key, value] of Object.entries(indices as Record<string, unknown>)) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ArchiveFormatError(`The archive's index level for "${key}" is not an object.`);
+      }
+
+      const entry = value as Record<string, unknown>;
+      const date = entry.date;
+
+      if (typeof date !== "string" || !DATE_PATTERN.test(date)) {
+        throw new ArchiveFormatError(
+          `The archive's index level for "${key}" has no usable date: ${JSON.stringify(date)}.`,
+        );
+      }
+
+      levels.push({
+        key,
+        // The label is decorative. A level without one still has its key to display, so this
+        // is the one field that falls back rather than refusing.
+        name: typeof entry.name === "string" ? entry.name : key,
+        date,
+        open: levelNumber(key, "open", entry.open),
+        high: levelNumber(key, "high", entry.high),
+        low: levelNumber(key, "low", entry.low),
+        close: levelNumber(key, "close", entry.close),
+        change: levelNumber(key, "change", entry.change),
+        percentChange: levelNumber(key, "percentChange", entry.percentChange),
+        turnover: levelNumber(key, "turnover", entry.turnover),
+      });
+    }
+
+    // Sorted by key so the order is this client's rather than whatever the file happens to
+    // hold, and so two archives with the same levels list them the same way.
+    return levels.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  }
+
+  /** The same, for the index levels. They change at most once a day, like the directory. */
+  let indicesFreshUntil = 0;
+
+  /**
+   * The exchange's index levels for the newest session, newest first in key order.
+   *
+   * ## Absent is not an error, malformed is
+   *
+   * An archive that predates this artifact publishes nothing at this path, and a caller
+   * showing an index rail should show nothing rather than fail, so a missing file is an
+   * empty array. A file that *is* there and cannot be read is a different thing and throws:
+   * something is published and wrong, which is worth knowing rather than rendering as an
+   * empty rail. That is the same split `manifest()` makes.
+   *
+   * ## The levels are not a substitute for the archive's own index arithmetic
+   *
+   * They are the exchange's, and they only reach back as far as the archive has been
+   * recording them. See `DatedIndexLevel`.
+   */
+  async function indices(): Promise<IndexLevel[]> {
+    // Held here rather than read back from the cache afterwards, for the reason spelled out
+    // on `readSessionDates`: with `noCache()` the write goes nowhere, and reading back would
+    // discard a perfectly good fetch.
+    let body = await cache.get(INDICES_KEY);
+
+    if (body === null || Date.now() >= indicesFreshUntil) {
+      try {
+        const fresh = await transport.get(INDICES_PATH);
+        body = fresh;
+        await cache.set(INDICES_KEY, fresh);
+      } catch (error) {
+        // A missing artifact is expected on an archive that predates it. Anything else is
+        // rethrown: a CDN that cannot be reached is not a fact about the archive, and
+        // reporting it as "no indices" would be a lie a caller could not detect.
+        if (!(error instanceof Error) || error.name !== "SessionNotFoundError") throw error;
+      }
+      indicesFreshUntil = Date.now() + manifestTtlMs;
+    }
+
+    if (body === null) return [];
+    return parseLevels(body);
+  }
+
+  /**
+   * One index's history, ascending, filtered to a range.
+   *
+   * The file holds the whole history, so the range is a filter over it rather than a request
+   * for less: one request, memoized, and every other range for this index is then free.
+   */
+  async function indexHistory(key: string, range: RangeOptions): Promise<DatedIndexLevel[]> {
+    const wanted = key.trim().toLowerCase();
+
+    if (!INDEX_KEY.test(wanted)) {
+      // A refusal rather than an empty answer: this key cannot name a file the archive could
+      // hold, so it is a caller's mistake rather than an index that is missing.
+      throw new ArchiveFormatError(
+        `"${key}" is not an index key. Keys are lowercase and hyphenated, and "nepse" is one; ` +
+          "read indices() for the rest.",
+      );
+    }
+
+    assertRange(range);
+    if (range.signal?.aborted === true) return [];
+
+    const rows = await readIndexHistory(wanted);
+
+    range.onProgress?.({
+      done: 1,
+      total: 1,
+      date: rows.at(-1)?.date ?? range.to,
+    });
+
+    return rows.filter((row) => row.date >= range.from && row.date <= range.to);
+  }
+
+  /**
+   * One index's whole history once read, kept for the mutable TTL, like the series files.
+   *
+   * A `null` value means "asked, and the archive publishes none for that key", remembered
+   * only for the TTL: an archive is expected to start publishing these, and an absence that
+   * outlived the fact would pin a client to an empty answer forever.
+   */
+  const indexMemo = new Map<string, { rows: DatedIndexLevel[] | null; until: number }>();
+
+  async function readIndexHistory(key: string): Promise<DatedIndexLevel[]> {
+    const memo = indexMemo.get(key);
+    if (memo !== undefined && Date.now() < memo.until) return memo.rows ?? [];
+
+    try {
+      const body = await transport.get(`${INDICES_DIRECTORY}/${key}.csv`);
+      const rows = parseIndexCsv(body);
+      indexMemo.set(key, { rows, until: Date.now() + manifestTtlMs });
+      return rows;
+    } catch (error) {
+      // Only "the archive publishes no history for this index" is worth remembering. A
+      // network failure is not a fact about the archive, so the next call tries again.
+      if (error instanceof Error && error.name === "SessionNotFoundError") {
+        indexMemo.set(key, { rows: null, until: Date.now() + manifestTtlMs });
+        return [];
+      }
+      throw error;
+    }
+  }
+
   return {
     manifest,
     session,
@@ -873,6 +1097,8 @@ export function createClient(options: ClientOptions = {}): NepseDataClient {
     history,
     closes,
     series,
+    indices,
+    indexHistory,
     symbols,
     directory,
     name,

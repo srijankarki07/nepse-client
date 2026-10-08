@@ -176,6 +176,41 @@ use `history()`; for a handful of scrips, `series()`. **For more than two or thr
 cheaper than `series()`**: a year of the whole market is one 450 KB request, where three scrips
 would be three files of roughly 180 KB each.
 
+### `indices()`
+
+The **exchange's own index levels** for the newest session, as an array of
+`{ key, name, date, open, high, low, close, change, percentChange, turnover }`.
+
+These are NEPSE's published levels: NEPSE, Sensitive, Float, Sensitive Float, and the
+thirteen sector sub-indices. They are not something this package computes, and they cannot
+be, because the archive holds no share counts and a capitalisation-weighted index needs
+them. If you want an index computed from the prices, that is `closes()` and your own
+arithmetic, and it is a different thing that should be labelled differently.
+
+```ts
+for (const level of await nepse.indices()) {
+  console.log(level.name, level.close, level.percentChange);
+}
+```
+
+**An archive that publishes none returns `[]`**, which is the ordinary case for one that
+predates the artifact, so a rail can hide itself rather than fail. A levels file that is
+present and unreadable **throws** instead, because "nothing is published" and "something is
+published and broken" are different facts and only one of them is safe to render as empty.
+
+### `indexHistory(key, { from, to })`
+
+One index's history across a range, ascending, where `key` is the `key` from `indices()`
+(`"nepse"`, `"life-insurance"`, `"microfinance"`). One request, then a filter.
+
+> **It does not reach back as far as the prices do.** The archive only ever sees the current
+> session, so it accumulates these from the day it began recording them rather than
+> reconstructing the past. A range starting before that simply has fewer points; it is not
+> an error, and there is nothing to re-scrape to fix it.
+
+A key the archive does not publish returns `[]`. A key that could not name a file at all
+(`"../../latest"`) throws, because that is a caller's mistake rather than a missing index.
+
 ### `symbols()`
 
 Tickers listed in the latest session.

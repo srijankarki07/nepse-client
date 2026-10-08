@@ -62,7 +62,9 @@ export {
 export {
   ArchiveFormatError,
   COLUMNS,
+  INDEX_COLUMNS,
   parseClosesCsv,
+  parseIndexCsv,
   parseSeriesCsv,
   parseSessionCsv,
 } from "./csv.js";
@@ -70,7 +72,9 @@ export {
 export type {
   ArchiveManifest,
   DatedCloses,
+  DatedIndexLevel,
   DatedQuote,
+  IndexLevel,
   ManifestResult,
   Quote,
   Session,

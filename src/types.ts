@@ -115,3 +115,55 @@ export interface SymbolEntry {
 
 /** Ticker to entry. What `directory()` returns. */
 export type SymbolDirectory = Record<string, SymbolEntry>;
+
+/**
+ * One index's level for one session. A row of `indexHistory`.
+ *
+ * ## These are the exchange's levels, not one this package computes
+ *
+ * NEPSE's indices are capitalisation-weighted over defined baskets, and the price archive
+ * holds no share counts, so the real level cannot be derived from it. These are published by
+ * the exchange and republished by the archive, which is why they exist as data rather than
+ * as arithmetic here.
+ *
+ * ## They do not reach back as far as the prices
+ *
+ * The archive accumulates index levels from the day it began recording them, because there
+ * is nowhere else to get them: the source only ever shows the current session. So a chart of
+ * an index starts where the archive's records start, which is later than the price history
+ * behind it. A range that begins earlier simply has fewer points.
+ */
+export interface DatedIndexLevel {
+  /** The trading session, `YYYY-MM-DD`. */
+  date: string;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  /** The index's closing level. */
+  close: number | null;
+  /** The day's change in points, as the exchange published it. */
+  change: number | null;
+  /**
+   * The day's change in percent, as the exchange published it.
+   *
+   * Carried rather than derived from `close` and the previous session, because the exchange
+   * rounds it and a chart labelling a move should show the published figure. Deriving it
+   * also needs the previous session, which the first point of any range does not have.
+   */
+  percentChange: number | null;
+  /** Value traded across the index's constituents, in NPR. */
+  turnover: number | null;
+}
+
+/** A level with the index it belongs to. What `indices()` returns. */
+export interface IndexLevel extends DatedIndexLevel {
+  /**
+   * The key the archive files this index under, and what `indexHistory` takes.
+   *
+   * Stable by construction: the archive maps its own labels to a fixed set of keys rather
+   * than deriving them, so a rename by the source cannot silently start a second file.
+   */
+  key: string;
+  /** The source's own label, for display. `"NEPSE Index"`, `"Life Insurance"`. */
+  name: string;
+}
