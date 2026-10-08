@@ -1,6 +1,6 @@
 {
   "name": "@srijankarki44/nepse-data",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Read NEPSE end-of-day prices from a maintained public archive — no API key, no scraping, no server",
   "type": "module",
   "license": "MIT",
