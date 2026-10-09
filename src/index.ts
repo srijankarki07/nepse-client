@@ -48,12 +48,15 @@ export {
 
 export {
   ArchiveUnavailableError,
+  CDN_HOST,
   DEFAULT_CONCURRENCY,
   DEFAULT_HOSTS,
+  ORIGIN_HOST,
   SessionNotFoundError,
   SymbolNotFoundError,
   cacheModeFor,
   createTransport,
+  hostsFor,
   mapWithConcurrency,
   type Transport,
   type TransportOptions,

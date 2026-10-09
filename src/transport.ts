@@ -1,12 +1,21 @@
 /**
  * Getting bytes out of the archive.
  *
- * ## Two hosts, because one of them is a CDN
+ * ## Two hosts, and which one goes first depends on the path
  *
  * jsDelivr serves the archive from an edge in Mumbai, which measured **28 ms** from Nepal
- * against 400 ms for `raw.githubusercontent.com`. It is the primary for that reason. Raw
- * is the origin, and it is the fallback: a CDN can be purged, can be having a bad minute,
- * or can be serving a cached copy older than the origin holds.
+ * against 400 ms for `raw.githubusercontent.com`. Raw is the origin, the archive itself
+ * rather than a copy of it.
+ *
+ * Which of the two to ask first is not one decision but two, because the archive is not one
+ * thing:
+ *
+ *   - **`data/daily/` is immutable.** A session file is written once and never rewritten, so
+ *     every host holds the same bytes and the only difference between them is distance. The
+ *     CDN wins there, and that tree carries the per-day walk — the one read where 28 ms
+ *     against 400 ms is worth two hundred requests.
+ *   - **Everything else is rewritten in place**, and there the CDN is not merely slower. It is
+ *     wrong. See {@link hostsFor}.
  *
  * Both were checked for CORS before this was written — `access-control-allow-origin: *`
  * on each — because without it a browser could not read the archive at all and the whole
@@ -81,7 +90,12 @@ export interface Transport {
 }
 
 export interface TransportOptions {
-  /** The default archive. Overridden mainly by tests. */
+  /**
+   * The archive's hosts. Overridden mainly by tests.
+   *
+   * The order given here is the order used, except that a mutable path is read from the
+   * origin first whichever position it was listed in. See {@link hostsFor}.
+   */
   hosts?: readonly string[];
   /** Injected so tests never touch the network. */
   fetch?: typeof fetch;
@@ -91,10 +105,13 @@ export interface TransportOptions {
   retries?: number;
 }
 
-export const DEFAULT_HOSTS = [
-  "https://cdn.jsdelivr.net/gh/srijankarki07/nepse-data@main",
-  "https://raw.githubusercontent.com/srijankarki07/nepse-data/main",
-] as const;
+/** jsDelivr's edge in Mumbai. Fast, and 28 ms from Nepal. */
+export const CDN_HOST = "https://cdn.jsdelivr.net/gh/srijankarki07/nepse-data@main";
+
+/** GitHub's raw host, which serves the archive itself rather than a copy of it. */
+export const ORIGIN_HOST = "https://raw.githubusercontent.com/srijankarki07/nepse-data/main";
+
+export const DEFAULT_HOSTS = [CDN_HOST, ORIGIN_HOST] as const;
 
 /** Measured: twelve was no faster than six. */
 export const DEFAULT_CONCURRENCY = 6;
@@ -125,7 +142,76 @@ const DEFAULT_RETRIES = 2;
  * follows: **immutable caches hard, mutable revalidates.** `no-cache` does not mean "do not
  * cache" — it means "revalidate before reuse", and both hosts send an `ETag`, so an
  * unchanged file costs one conditional request answered with a `304` and a body of nothing.
+ *
+ * **This is the browser's layer only.** Revalidating against an edge that is itself holding a
+ * stale copy confirms the stale copy rather than replacing it, which is a hole this function
+ * cannot close and {@link hostsFor} does, by not asking the edge about a mutable path at all.
+ * The two are one policy in two halves: this decides whether the browser may reuse what it
+ * has, `hostsFor` decides who is asked when it may not.
  */
+/**
+ * The hosts to try for a path, in order.
+ *
+ * ## The CDN's edge cache, which revalidation cannot reach
+ *
+ * `cacheModeFor` below stopped the *browser* holding a week-old `latest.json`. It did not stop
+ * jsDelivr holding one, one layer down, and that is the layer that matters.
+ *
+ * jsDelivr serves a branch ref with `cache-control: public, max-age=604800, s-maxage=43200` —
+ * seven days for a browser, **twelve hours at the edge**. `no-cache` on the request makes the
+ * browser revalidate; the request then lands on an edge that answers from its own copy, with
+ * its own `ETag`, and revalidation confirms the stale body instead of replacing it.
+ *
+ * Measured against the live archive the morning after a session was published:
+ *
+ *   - `data/latest.json` from the CDN said `latest: 2026-10-07`, `age: 33803`. The origin said
+ *     `2026-10-08`, and the session file for the eighth was on both hosts. A site reading the
+ *     manifest through the CDN showed the seventh and had no way to tell.
+ *   - `data/closes/2026.csv` from the CDN still ended at the previous session's row.
+ *   - `data/indices/latest.json` from the CDN was already current.
+ *
+ * The third line is why this cannot be tuned away with a TTL. Each file carries its own edge
+ * entry with its own age, so the archive is not uniformly stale but **unevenly fresh** — and a
+ * client that takes its date from `latest.json` and its levels from `indices/latest.json`
+ * renders a page whose table is a day old and whose tiles are current. Nothing on screen says
+ * the two disagree, which makes that mixture worse than a clean staleness would be.
+ *
+ * No request option forces an edge to revalidate. So a path the archive rewrites is read from
+ * the origin. A CDN a day behind is not a cache miss — it is a different answer, and the
+ * response does not say which one arrived.
+ *
+ * ## What it costs
+ *
+ * The mutable files a page reads are few and small: the index, the date list, the ticker
+ * directory, one wide closes file per year. They are fetched in parallel, so a reader pays one
+ * origin round trip rather than one per file. The per-day walk that made the CDN worth having
+ * reads `data/daily/`, which is exactly the tree that keeps it.
+ */
+export function hostsFor(
+  path: string,
+  hosts: readonly string[] = DEFAULT_HOSTS,
+): readonly string[] {
+  // One host is not a policy question, and a caller who supplied one meant it.
+  if (hosts.length < 2) return hosts;
+
+  // Immutable: every host holds the same bytes, so take the nearest one, which is the CDN.
+  if (path.startsWith("data/daily/")) return hosts;
+
+  // Mutable: the origin, because an edge copy may be hours old and no response says so. A
+  // stable sort, so a host that is neither the origin nor a CDN keeps its given position.
+  return [...hosts].sort((a, b) => Number(isOrigin(b)) - Number(isOrigin(a)));
+}
+
+/**
+ * Whether a host is the origin rather than a copy of it.
+ *
+ * Matched on the name so a fork, a mirror or a self-hosted archive is ordered by what it is
+ * rather than by where the caller happened to list it.
+ */
+function isOrigin(host: string): boolean {
+  return host.includes("raw.githubusercontent.com");
+}
+
 export function cacheModeFor(path: string): "default" | "no-cache" {
   // A session file is written once and never rewritten, so the HTTP cache may hold it for
   // as long as it likes. This tree carries every long-range read, which is where holding it
@@ -209,7 +295,7 @@ export function createTransport(options: TransportOptions = {}): Transport {
   async function get(path: string): Promise<string> {
     let lastError: unknown = null;
 
-    for (const host of hosts) {
+    for (const host of hostsFor(path, hosts)) {
       for (let attempt = 0; attempt <= retries; attempt++) {
         if (attempt > 0) await sleep(200 * 2 ** (attempt - 1));
 

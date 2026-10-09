@@ -68,7 +68,7 @@ it.**
 | `cache` | in-memory | `memoryCache()`, `localStorageCache({ maxBytes })`, `fileCache(dir)`, `noCache()` |
 | `concurrency` | `6` | requests in flight at once |
 | `manifestTtlMs` | `300_000` | how long the index may be reused |
-| `hosts` | jsDelivr, then raw GitHub | in order |
+| `hosts` | jsDelivr, then raw GitHub | see *Which host answers* below |
 | `fetch` | global `fetch` | inject for testing |
 
 ### `manifest()`
@@ -255,6 +255,36 @@ without asking: a week-old close on screen, and a chart missing its newest sessi
 nothing to indicate it. Session files are immutable and are still cached hard. The
 revalidation is a conditional request both hosts answer with `304` and no body, so it costs
 a round trip and no bytes.
+
+### Which host answers
+
+The hosts are not interchangeable, and the default above is the *configured* order rather
+than the order a given file is read in.
+
+jsDelivr's edge cache is the second layer of the same problem, and revalidation cannot reach
+it. The edge serves a branch ref with `s-maxage=43200`, so a request that revalidates
+correctly lands on a copy of the file that may be **twelve hours old** and is confirmed
+against the edge's own `ETag`. Measured against the live archive the morning after a session
+was published, `data/latest.json` from the CDN said `2026-10-07, age: 33803` while the origin
+said `2026-10-08` — and `data/closes/2026.csv` was behind too, while
+`data/indices/latest.json` was already current.
+
+That last part is what makes it dangerous rather than merely stale. Each file carries its own
+edge entry with its own age, so the archive is **unevenly** fresh, and a page that takes its
+date from one file and its figures from another renders a table a day old beside tiles that
+are current — with nothing on screen saying the two disagree.
+
+So the client asks the host that cannot be behind:
+
+- **`data/daily/`** — immutable, one file per session, written once. Every host holds the
+  same bytes, so the CDN goes first; it is 28 ms from Nepal against the origin's 400 ms, and
+  this tree carries the per-day walk where that gap is worth 200 requests.
+- **Everything else** — the index, the date list, the directory, `closes`, `series`,
+  `indices` — is rewritten in place, so the origin goes first.
+
+A `hosts` you pass is reordered the same way, so the origin is asked first for a mutable path
+whichever position you listed it in; a host that is neither the origin nor a CDN keeps the
+order you gave. Pass one host and it is used for everything.
 
 **`localStorageCache` has a budget, and a year does not fit in it.** A session is about
 18 KB and a year is about 230 of them, so a yearly range is roughly 8 MB of UTF-16 against a
