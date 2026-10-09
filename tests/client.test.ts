@@ -9,11 +9,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CDN_HOST,
   COLUMNS,
+  ORIGIN_HOST,
   SessionNotFoundError,
   SymbolNotFoundError,
   cacheModeFor,
   createClient,
+  hostsFor,
   memoryCache,
   noCache,
   type Cache,
@@ -34,6 +37,12 @@ function sessionBody(date: string, scrips: Record<string, number>): string {
  * Anything not in `files` answers 404, which is how the real hosts behave for a date the
  * archive does not hold. The options each request carried are recorded beside the URLs so
  * the cache mode the client asks for can be asserted per path.
+ *
+ * Both hosts answer from the same `files`, which is what makes the host policy testable: the
+ * file a test gets back does not depend on which host was asked, only the URL it was asked
+ * with does. A ref sits between the repository and the file on both — jsDelivr writes it
+ * `nepse-data@main/data/…` and raw writes it `nepse-data/main/data/…` — so it is dropped
+ * here and one set of keys serves either.
  */
 function fakeArchive(files: Record<string, string>) {
   const requested: string[] = [];
@@ -46,7 +55,12 @@ function fakeArchive(files: Record<string, string>) {
 
     const marker = "/nepse-data";
     const at = href.indexOf(marker);
-    const path = at === -1 ? href : href.slice(href.indexOf("/", at + marker.length) + 1);
+    const path =
+      at === -1
+        ? href
+        : href
+            .slice(at + marker.length)
+            .replace(/^\/?(@[^/]*|[^/]*)\//, "");
     const body = files[path];
 
     return body === undefined
@@ -102,7 +116,9 @@ describe("manifest", () => {
     expect(manifest.latest).toBe("2026-10-01");
     expect(manifest.previous).toBe("2026-09-30");
     expect(manifest.sessions).toBe(3);
-    expect(manifest.source).toContain("jsdelivr");
+    // The origin, because the index is rewritten every session and an edge copy of it can be
+    // twelve hours old. See `hostsFor`.
+    expect(manifest.source).toContain("raw.githubusercontent");
   });
 
   it("is served from cache on the second call", async () => {
@@ -249,6 +265,74 @@ describe("the cache mode asked of the HTTP layer", () => {
     expect(cacheModeFor("data/series/NABIL.csv")).toBe("no-cache");
     expect(cacheModeFor("data/closes/2025.csv")).toBe("no-cache");
     expect(cacheModeFor("data/daily/2011/2011-06-13.csv")).toBe("default");
+  });
+});
+
+describe("which host a path is read from", () => {
+  it("reads a mutable path from the origin, whatever order the hosts came in", () => {
+    // The bug this exists for. The CDN's edge held `latest.json` at `2026-10-07` for a whole
+    // morning after the eighth was published, while the origin served `2026-10-08` and the
+    // session file for the eighth sat on both hosts. `no-cache` cannot make an edge
+    // revalidate, so the order has to keep the edge out of the way instead.
+    for (const path of [
+      "data/latest.json",
+      "data/sessions.json",
+      "data/symbols.json",
+      "data/closes/2026.csv",
+      "data/series/NABIL.csv",
+      "data/indices/latest.json",
+    ]) {
+      expect(hostsFor(path)[0], path).toBe(ORIGIN_HOST);
+    }
+  });
+
+  it("keeps the CDN first for a session file, which is where the speed is worth having", () => {
+    expect(hostsFor("data/daily/2026/2026-10-08.csv")[0]).toBe(CDN_HOST);
+  });
+
+  it("reorders the hosts rather than dropping one", () => {
+    // A CDN can be purged or having a bad minute, so it stays as the fallback for a path it
+    // is not asked about first — and the origin stays the fallback for one it is.
+    expect(hostsFor("data/latest.json")).toEqual([ORIGIN_HOST, CDN_HOST]);
+    expect(hostsFor("data/daily/2026/2026-10-08.csv")).toEqual([CDN_HOST, ORIGIN_HOST]);
+  });
+
+  it("leaves a single host alone", () => {
+    const hosts = ["https://one.example"];
+    expect(hostsFor("data/latest.json", hosts)).toEqual(hosts);
+  });
+
+  it("keeps the caller's order for hosts it cannot classify", () => {
+    const hosts = ["https://a.example", "https://b.example"];
+    expect(hostsFor("data/latest.json", hosts)).toEqual(hosts);
+  });
+
+  it("recognises an origin by name, so a mirror or a fork counts as one", () => {
+    const hosts = ["https://cdn.example", "https://raw.githubusercontent.com/someone/else/main"];
+    expect(hostsFor("data/latest.json", hosts)[0]).toBe(hosts[1]);
+  });
+
+  it("asks the origin for the manifest, so an edge holding an older day cannot set the date", async () => {
+    const requested: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      const href = String(url);
+      requested.push(href);
+
+      // Both hosts answer, and under the old order the one that answers first wins. The CDN's
+      // answer is a day behind, which is exactly what a reader used to be shown.
+      const body = href.includes("jsdelivr")
+        ? { latest: "2026-10-01", previous: null, sessions: 1, years: { "2026": 1 } }
+        : { latest: "2026-10-02", previous: "2026-10-01", sessions: 2, years: { "2026": 2 } };
+
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const manifest = await createClient({ fetch: fetchImpl, cache: noCache(), retries: 0 }).manifest({
+      refresh: true,
+    });
+
+    expect(manifest.latest).toBe("2026-10-02");
+    expect(requested.filter((url) => url.includes("jsdelivr"))).toHaveLength(0);
   });
 });
 
@@ -1276,20 +1360,37 @@ describe("directory and names", () => {
 });
 
 describe("hosts", () => {
-  it("falls back to the origin when the CDN fails", async () => {
+  it("falls back to the CDN when the origin fails, on a path the origin is asked for", async () => {
     const requested: string[] = [];
     const fetchImpl = (async (url: string) => {
       const href = String(url);
       requested.push(href);
 
-      if (href.includes("jsdelivr")) return new Response("nope", { status: 503 });
+      if (href.includes("raw.githubusercontent")) return new Response("nope", { status: 503 });
       return new Response(MANIFEST, { status: 200 });
     }) as unknown as typeof fetch;
 
     const client = createClient({ fetch: fetchImpl, retries: 0 });
     const manifest = await client.manifest();
 
-    expect(manifest.source).toContain("raw.githubusercontent");
+    expect(manifest.source).toContain("jsdelivr");
+    expect(requested.some((url) => url.includes("raw.githubusercontent"))).toBe(true);
+  });
+
+  it("falls back to the origin when the CDN fails, on a path the CDN is asked for", async () => {
+    const requested: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      const href = String(url);
+      requested.push(href);
+
+      if (href.includes("jsdelivr")) return new Response("nope", { status: 503 });
+      return new Response(sessionBody("2026-10-01", { NABIL: 566 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = createClient({ fetch: fetchImpl, retries: 0 });
+    const session = await client.session("2026-10-01");
+
+    expect(session.rows).toHaveLength(1);
     expect(requested.some((url) => url.includes("jsdelivr"))).toBe(true);
   });
 
